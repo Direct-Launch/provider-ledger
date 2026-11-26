@@ -158,11 +158,13 @@ const surfacesOf = (store, range, today, totals) => {
     if (touched) sub.sessions += 1;
   }
   const top = (map) => [...map.values()].sort(bySurface).slice(0, SURFACE_TOP);
+  const mcpViaCodeMode = groups.mcp.size === 0 && (groups.tool.get('execute')?.calls ?? 0) > 0;
   const dispatches = [...groups.agent.values()].reduce((n, r) => n + r.calls, 0);
   return {
     calls,
     skills: top(groups.skill),
     mcp: top(groups.mcp),
+    mcpViaCodeMode,
     dispatches,
     sub,
     share: totals.cost > 0 ? (sub.cost / totals.cost) * 100 : null,
@@ -176,7 +178,7 @@ const surfaceLines = (store, range, today, totals) => {
   if (s.calls === 0 && s.sub.sessions === 0) return ['Surfaces: no tool calls in this period.'];
   const list = (rows) => rows.map((r) => `${r.name} ${r.calls} ${r.calls === 1 ? 'call' : 'calls'}, ${compact(r.contextChars)} chars`).join('; ');
   const lines = [];
-  lines.push(`Surfaces, top skills: ${s.skills.length > 0 ? list(s.skills) : 'none'}. Top MCP servers: ${s.mcp.length > 0 ? list(s.mcp) : 'none'}.`);
+  lines.push(`Surfaces, top skills: ${s.skills.length > 0 ? list(s.skills) : 'none'}. ${s.mcp.length > 0 ? `Top MCP servers: ${list(s.mcp)}.` : s.mcpViaCodeMode ? 'MCP: none by mcp_ name (code-mode execute counted under tools).' : 'Top MCP servers: none.'}`);
   const share = s.share !== null ? `${pct(s.share)} of spend (${money(s.sub.cost)})` : s.replyShare !== null ? `${pct(s.replyShare)} of replies` : 'no replies';
   lines.push(`Subagents: ${s.dispatches} ${s.dispatches === 1 ? 'dispatch' : 'dispatches'}, ${s.sub.sessions} ${s.sub.sessions === 1 ? 'session' : 'sessions'} with ${share}, already inside the totals above. Chars are what a tool put into the conversation; no provider bills per tool.`);
   const pending = Number(store.toolsPending) || 0;

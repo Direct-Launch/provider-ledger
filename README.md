@@ -170,7 +170,7 @@ Spend, speed and types are recorded for **every** provider OpenCode talks to, su
 - **The provider list is a manifest declaration approved at install.** An extension cannot read "whatever you have configured": only the providers named in the manifest are handed over, so a provider without a reader has no balance row until a release adds one.
 - **Days and months are UTC**, not local time, so "Today" can differ from your calendar near midnight.
 - **Agent attribution depends on what OpenCode records.** Replies whose agent cannot be read are shown as uncategorised.
-- **Tool attribution is only as specific as the tool's name.** An MCP server is recognised from the `mcp_<server>_<tool>` convention. If your setup reaches its MCP servers through a wrapper tool (a "code mode" `execute` tool, say), every call to them is one ordinary tool, and the ledger does not look inside the code it runs to guess a server.
+- **Tool attribution is only as specific as the tool's name.** An MCP server is recognised from the `mcp_<server>_<tool>` convention. If your setup reaches its MCP servers through a wrapper tool (a "code mode" `execute` tool, say), every call to them is one ordinary tool, and the ledger does not look inside the code it runs to guess a server. When a period has an `execute` row and no `mcp_` row, the MCP servers block says so instead of looking like tracking failed.
 - **The subagent share needs the session listing to name a parent.** A session whose listing carries none is not guessed to be a subagent.
 - **Tool calls fill in after the first sync, newest first.** Until the older sessions have been read, longer periods on the Surfaces tab are partial, and the tab says how many sessions are left.
 

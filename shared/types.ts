@@ -251,6 +251,8 @@ export type PeriodSurfaces = {
   skills: SurfaceRow[];
   mcp: SurfaceRow[];
   other: SurfaceRow[];
+  /** No tool ran under an `mcp_` name, yet a code-mode `execute` tool did: MCP calls made through it are counted as `execute`. */
+  mcpViaCodeMode: boolean;
   subagents: {
     /** Calls to the subagent tool. */
     dispatches: number;

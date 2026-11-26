@@ -1159,6 +1159,7 @@ var buildSurfaces = (entries, subagent, range, totals) => {
     skills: ranked(groups.skill, SURFACE_TOP),
     mcp: ranked(groups.mcp, SURFACE_TOP),
     other: ranked(groups.tool, SURFACE_TOP),
+    mcpViaCodeMode: groups.mcp.size === 0 && (groups.tool.get("execute")?.calls ?? 0) > 0,
     subagents: {
       dispatches,
       types: [...groups.agent.values()].sort((a, b) => b.calls - a.calls || bySurface(a, b)).slice(0, SUBAGENT_TYPES_TOP),

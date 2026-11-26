@@ -468,3 +468,50 @@ describe('the agent tool', () => {
     expect(await run(store)).toContain('Surfaces: no tool calls in this period.');
   });
 });
+
+describe('MCP through a code-mode tool', () => {
+  const surfacesOfCalls = (parts: Part[]) => {
+    const s = emptyStore();
+    applySession(s, ref('a', 100), [reply(NOW - 1000, parts)]);
+    return deriveLedger(s, NOW).periods.today.surfaces;
+  };
+
+  test('the panel flag is set when an execute row exists and no mcp_ row does', () => {
+    const withExecute = surfacesOfCalls([done('execute', { code: 'x' }, 40), done('read', {}, 5)]);
+    expect(withExecute.mcp).toEqual([]);
+    expect(withExecute.mcpViaCodeMode).toBe(true);
+    expect(withExecute.other.map((r) => r.name)).toContain('execute');
+  });
+
+  test('it is not set without an execute row, nor when a real mcp_ row exists, nor with no tools at all', () => {
+    expect(surfacesOfCalls([done('read', {}, 5)]).mcpViaCodeMode).toBe(false);
+    expect(surfacesOfCalls([done('execute', {}, 5), done('mcp_github_search', {}, 5)]).mcpViaCodeMode).toBe(false);
+    expect(surfacesOfCalls([]).mcpViaCodeMode).toBe(false);
+  });
+
+  const text = async (parts: Part[]): Promise<string> => {
+    const now = Date.now();
+    const s = emptyStore();
+    applySession(s, ref('a', 100), [reply(now - 1000, parts)]);
+    const path = join(await scratch(), 'store.json');
+    await saveStore(path, s, now);
+    const saved = process.env.PROVIDER_LEDGER_STORE;
+    process.env.PROVIDER_LEDGER_STORE = path;
+    try {
+      let tool: { execute: (i: unknown) => Promise<{ content: string }> } | null = null;
+      await plugin.setup({ tool: { transform: async (cb: (t: { add: (x: typeof tool) => void }) => void) => { cb({ add: (x) => { tool = x; } }); } } });
+      return (await tool!.execute({ period: 'd30' })).content;
+    } finally {
+      if (saved === undefined) delete process.env.PROVIDER_LEDGER_STORE;
+      else process.env.PROVIDER_LEDGER_STORE = saved;
+    }
+  };
+
+  test('the agent tool says so with an execute row, and keeps the plain line without one', async () => {
+    expect(await text([done('execute', {}, 5)])).toContain('MCP: none by mcp_ name (code-mode execute counted under tools)');
+    const plain = await text([done('read', {}, 5)]);
+    expect(plain).toContain('Top MCP servers: none.');
+    expect(plain).not.toContain('code-mode');
+    expect(await text([done('execute', {}, 5), done('mcp_github_search', {}, 5)])).toContain('Top MCP servers: github 1 call');
+  });
+});

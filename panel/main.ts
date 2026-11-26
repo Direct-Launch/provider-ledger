@@ -676,7 +676,9 @@ const surfacesView = (data: PanelPayload, view4: PeriodView): HTMLElement[] => {
   parts.push(
     surfaceTotals(view4),
     surfaceSection(`Skills · ${view4.label}`, s.skills, 'No skill was loaded in this period.', 'Skill'),
-    surfaceSection(`MCP servers · ${view4.label}`, s.mcp, 'No MCP server was called in this period, or its tools do not use the mcp_<server>_<tool> names.', 'Server'),
+    surfaceSection(`MCP servers · ${view4.label}`, s.mcp, s.mcpViaCodeMode
+      ? 'No tool ran under an mcp_ name. MCP calls made through a code-mode tool are counted under Other tools, as execute.'
+      : 'No MCP server was called in this period, or its tools do not use the mcp_<server>_<tool> names.', 'Server'),
     subagentBlock(view4),
     surfaceSection(`Other tools · ${view4.label}`, s.other, 'No other tool was called in this period.', 'Tool'),
   );
