@@ -14,6 +14,7 @@ import {
 import type { Handle } from '@openchamber/sdk/ui';
 
 import { DASH, ago, agoLong, compact, money, monthName, parseCap, percent, pricePerMillion, providerName, resetIn, shareText, shortDate, tokensPerSecond } from '../shared/format.ts';
+import { clampScroll, drawnSignature } from '../shared/redraw.ts';
 import { CATEGORY_HINTS, CATEGORY_LABELS, PERIOD_IDS, PERIOD_LABELS } from '../shared/types.ts';
 import type { BalanceCard, BudgetResult, BudgetRow, ExportResult, LedgerSettings, MonthRow, PanelPayload, PeriodId, PeriodProject, PeriodView, SettingsResult, SurfaceRow, SyncResult, TypeCategoryRow } from '../shared/types.ts';
 
@@ -48,19 +49,28 @@ const svg = <K extends keyof SVGElementTagNameMap>(tag: K, attrs: Record<string,
 
 const head = h('div', 'pl-head');
 head.appendChild(h('h1', 'pl-title', 'Provider Ledger'));
-const badgeSlot = h('div');
-head.appendChild(badgeSlot);
-const bannerSlot = h('div');
-bannerSlot.style.display = 'flex';
-bannerSlot.style.flexDirection = 'column';
-bannerSlot.style.gap = '8px';
-const stateSlot = h('div');
-const bodySlot = h('div');
-bodySlot.style.display = 'flex';
-bodySlot.style.flexDirection = 'column';
-bodySlot.style.gap = '14px';
-const footSlot = h('div', 'pl-foot');
-root.append(head, bannerSlot, stateSlot, bodySlot, footSlot);
+// The slots that stay in the document. A render never touches them until its new content is complete.
+const liveBadge = h('div');
+head.appendChild(liveBadge);
+const liveBanner = h('div');
+liveBanner.style.display = 'flex';
+liveBanner.style.flexDirection = 'column';
+liveBanner.style.gap = '8px';
+const liveState = h('div');
+const liveBody = h('div');
+liveBody.style.display = 'flex';
+liveBody.style.flexDirection = 'column';
+liveBody.style.gap = '14px';
+const liveFoot = h('div', 'pl-foot');
+root.append(head, liveBanner, liveState, liveBody, liveFoot);
+
+// What the page-building code writes into. Between renders these are the live slots; while one is being
+// built they are detached copies, so the document keeps its height (and its scroll position) until the swap.
+let badgeSlot = liveBadge;
+let bannerSlot = liveBanner;
+let stateSlot = liveState;
+let bodySlot = liveBody;
+let footSlot = liveFoot;
 
 let payload: PanelPayload | null = null;
 let period: PeriodId = 'd7';
@@ -81,15 +91,12 @@ let loading = false;
 let syncingNow = false;
 let timer: ReturnType<typeof setTimeout> | null = null;
 let disposers: Array<() => void> = [];
+/** What the last render drew, so a poll that brings nothing new can skip the redraw. */
+let drawnSig: string | null = null;
 
 const track = <T extends Handle<never>>(handle: T): T => {
   disposers.push(() => handle.dispose());
   return handle;
-};
-const clearDynamic = (): void => {
-  for (const dispose of disposers) dispose();
-  disposers = [];
-  for (const slot of [bannerSlot, stateSlot, bodySlot, footSlot, badgeSlot]) slot.replaceChildren();
 };
 
 // ---- Data -----------------------------------------------------------------
@@ -115,7 +122,8 @@ const load = async (): Promise<void> => {
     loadError = describe(error);
   } finally {
     loading = false;
-    renderUnlessEditing();
+    // A poll that brought nothing new (same data, same "ago" wording) draws nothing.
+    if (drawnSig === null || drawnSignature(payload, loadError) !== drawnSig) renderUnlessEditing();
     schedule();
   }
 };
@@ -1095,9 +1103,8 @@ const footer = (data: PanelPayload): void => {
 
 // ---- Render ---------------------------------------------------------------
 
-const render = (): void => {
-  clearDynamic();
-
+/** Draw the page into the slots; `render` points them at detached nodes first and swaps the result in. */
+const build = (): void => {
   if (loadError) {
     track(mountBanner(bannerSlot, { tone: 'error', title: 'Could not read the ledger', body: loadError }));
   }
@@ -1181,15 +1188,52 @@ const render = (): void => {
     if (ollama) bodySlot.appendChild(ollama);
   }
   footer(data);
+};
+
+/** The element the document scrolls by. */
+const scroller = (): HTMLElement => (document.scrollingElement ?? document.documentElement) as HTMLElement;
+
+/**
+ * Build the new page detached, then swap it in with one `replaceChildren` per slot, so the document never
+ * collapses to a short page in between (a layout in that gap clamps the scroll position to the top). The
+ * scroll position is read before the swap and put back, clamped to the new page, after it.
+ */
+const render = (): void => {
+  const previous = disposers;
+  disposers = [];
+  badgeSlot = h('div');
+  bannerSlot = h('div');
+  stateSlot = h('div');
+  bodySlot = h('div');
+  footSlot = h('div');
+  const staged: Array<[HTMLElement, HTMLElement]> = [[liveBadge, badgeSlot], [liveBanner, bannerSlot], [liveState, stateSlot], [liveBody, bodySlot], [liveFoot, footSlot]];
+  try {
+    build();
+  } finally {
+    // Whatever happened while building, the slots go back to the live ones and the swap still runs.
+    badgeSlot = liveBadge;
+    bannerSlot = liveBanner;
+    stateSlot = liveState;
+    bodySlot = liveBody;
+    footSlot = liveFoot;
+
+    const page = scroller();
+    const top = page.scrollTop;
+    for (const [live, next] of staged) live.replaceChildren(...Array.from(next.childNodes));
+    for (const dispose of previous) dispose();
+    drawnSig = drawnSignature(payload, loadError);
+
+    const wanted = clampScroll(top, page.scrollHeight, page.clientHeight);
+    if (Math.abs(page.scrollTop - wanted) > 0.5) page.scrollTop = wanted;
+  }
 
   if (refocusPeriod) {
     refocusPeriod = false;
-    const tab = bodySlot.querySelector<HTMLElement>(`[role="tab"][data-id="${period}"]`);
-    tab?.focus();
+    liveBody.querySelector<HTMLElement>(`[role="tab"][data-id="${period}"]`)?.focus();
   }
   if (refocusView) {
     refocusView = false;
-    bodySlot.querySelector<HTMLElement>(`[role="tab"][data-id="${activeView}"]`)?.focus();
+    liveBody.querySelector<HTMLElement>(`[role="tab"][data-id="${activeView}"]`)?.focus();
   }
 };
 
