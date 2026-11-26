@@ -1,0 +1,68 @@
+{
+  "name": "provider-ledger",
+  "version": "0.4.0",
+  "private": true,
+  "type": "module",
+  "description": "What each model provider costs, what it was for, how fast it is, and what is left on it.",
+  "license": "MIT",
+  "openchamber": {
+    "apiVersion": 1,
+    "engines": {
+      "openchamber": ">=2.7.1"
+    },
+    "id": "provider-ledger",
+    "name": "Provider Ledger",
+    "icon": "line-chart",
+    "contributes": {
+      "panel": {
+        "id": "provider-ledger",
+        "name": "Provider Ledger",
+        "icon": "line-chart",
+        "entry": "panel/index.html"
+      },
+      "statusSection": {
+        "source": {
+          "path": "/status",
+          "interval": 60000
+        },
+        "title": "Spend",
+        "height": 96
+      },
+      "service": {
+        "entry": "service/main.js",
+        "runtime": "host",
+        "provides": [
+          "quota",
+          "opencode"
+        ]
+      },
+      "quota": {
+        "providers": [
+          "opencode-go",
+          "opencode",
+          "ollama-cloud",
+          "console-ollama-cloud",
+          "ollama",
+          "deepseek",
+          "anthropic"
+        ]
+      },
+      "opencodePlugin": "plugin"
+    }
+  },
+  "scripts": {
+    "build": "bun x openchamber-guest-bundle panel/main.ts panel/main.js && bun x openchamber-guest-bundle --node service/main.ts service/main.js",
+    "check": "bun x openchamber-guest-check ./",
+    "typecheck": "bun x tsc --noEmit",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "@openchamber/sdk": "2.7.1"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^7"
+  }
+}
