@@ -71,3 +71,23 @@ each tool's result was. It cannot see a per-tool invoice — there is no such nu
   rebuild is required only for the class/agent join, not for the totals).
 - **0.5.1** surfaces in the agent tool's text and in Work Status (one line: the biggest
   context contributor this week).
+
+## 6. As built (0.5.0)
+
+- **The store stays version 4.** The 0.4.0 history rebuild may be running when 0.5.0 installs, and a
+  version bump would throw it away. Tool calls are a second, resumable pass: `store.tools[sessionId]`
+  holds `{ toolsSynced, rows }` (rows keyed `date|provider|model|class|name`), `toolsSynced` being the
+  session's `time.updated` when its messages were read for tools. A session already synced and unchanged is
+  skipped; the existing buckets are never touched. `store.toolsPending` counts what is left.
+- **Order of reading.** Sessions changed in the last 30 days that lack current buckets or tool calls come
+  first, newest first (one read fills both); then the unchanged oldest-first rebuild; then older sessions
+  that only lack tool calls, newest first. Never more than `maxSessions` reads a run.
+- **Subagent sessions.** `SessionEntry.parent` is set from the session listing's `parentID` (also
+  `parentId`, `parent_id`, `parent` as id or `{ id }`), and is filled in for sessions already read from the
+  listing alone. Nothing is derived from any other relation. Share = spend of marked sessions / spend of
+  the period; the same buckets, never added twice.
+- **What the real payload showed** (OpenCode 2.4.2's own store, read-only, 2026-11-26): the skill tool's
+  input is `{ id }`, not `{ name }`, and the subagent tool is named `subagent` with input `{ agent }`, not
+  `task` with `subagent_type`. All four spellings are read. MCP tools were called through a Code Mode
+  `execute` tool, so no `mcp_<server>_<tool>` name occurs there and such calls are `tool:execute`; a server
+  is never guessed from the code inside it.

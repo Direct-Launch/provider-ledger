@@ -4,6 +4,8 @@ import { canonicalProvider, providerName } from '../shared/format.ts';
 import { PERIOD_IDS, PERIOD_LABELS, SPEND_CATEGORIES, STORE_VERSION } from '../shared/types.ts';
 import { UNATTRIBUTED, cleanKey, placementOf, projectKeyOf } from './attribution.ts';
 import { UNKNOWN_AGENT, categoryOf, defaultSettings, scopeOf } from './spend.ts';
+import { parseToolKey, toolCallsOf, toolKey } from './tools.ts';
+import type { ParsedToolKey } from './tools.ts';
 import type {
   BalanceCard,
   BalanceSnapshot,
@@ -15,6 +17,7 @@ import type {
   PeriodModel,
   PeriodProject,
   PeriodProvider,
+  PeriodSurfaces,
   PeriodTypes,
   PeriodView,
   RangeTotals,
@@ -23,7 +26,9 @@ import type {
   SpendCategory,
   SpendScope,
   Store,
+  SurfaceRow,
   Tokens,
+  ToolRow,
   TypeCategoryRow,
   TypeTotals,
 } from '../shared/types.ts';
@@ -33,6 +38,8 @@ export const RETENTION_DAYS = 3 * 366;
 /** The store file never grows past this; the oldest days go first. */
 export const MAX_STORE_BYTES = 16 * 1024 * 1024;
 export const MAX_SESSIONS_PER_RUN = 40;
+/** Sessions touched in this many days have their tool calls read before any older history. */
+export const RECENT_TOOLS_DAYS = 30;
 /** Per session-bucket sample cap; beyond it samples are thinned evenly. */
 export const SAMPLE_CAP = 300;
 export const DAY_MS = 86_400_000;
@@ -316,7 +323,47 @@ export const aggregateMessages = (
   return { buckets, skipped };
 };
 
-export type SessionRef = { id: string; updated: number; directory?: string | null; /** The session's own agent, when the listing carries one. */ agent?: string | null };
+const newToolRow = (): ToolRow => ({ calls: 0, generated: 0, contextChars: 0 });
+
+/**
+ * Tool calls of one session's messages, per `date|provider|model|class|name`. A call counts once
+ * however far it got (a call still streaming or running has no result, so no context). The reply's
+ * generated tokens (output and reasoning) are added once per reply for each class and name it
+ * called, so a reply that called one tool three times does not count its tokens three times; a
+ * reply that called two different tools counts them under each, and the Surfaces tab says so.
+ */
+export const aggregateTools = (messages: unknown[]): Record<string, ToolRow> => {
+  const rows: Record<string, ToolRow> = {};
+  for (const raw of messages) {
+    const calls = toolCallsOf(raw);
+    if (calls.length === 0) continue;
+    const m = normalizeMessage(raw);
+    if (!m) continue;
+    const generated = m.tokens.output + m.tokens.reasoning;
+    const counted = new Set<string>();
+    for (const call of calls) {
+      const key = toolKey(m.date, m.provider, m.model, call.cls, call.name);
+      const row = (rows[key] ??= newToolRow());
+      row.calls += 1;
+      row.contextChars += call.contextChars;
+      if (!counted.has(key)) {
+        counted.add(key);
+        row.generated += generated;
+      }
+    }
+  }
+  return rows;
+};
+
+export type SessionRef = {
+  id: string;
+  updated: number;
+  directory?: string | null;
+  /** The session's own agent, when the listing carries one. */
+  agent?: string | null;
+  /** The session this one was spawned from, when the listing says so: it is a subagent session. */
+  parent?: string | null;
+};
 
 /**
  * Which sessions need reading: any session the store has never seen (whatever
@@ -339,6 +386,41 @@ export const selectSessions = (
   return { selected: due.slice(0, max), pending: Math.max(0, due.length - max) };
 };
 
+/** A session's buckets are older than the session itself, or it has none. */
+const mainDue = (store: Store, ref: SessionRef): boolean => {
+  const seen = store.sessions[ref.id];
+  return seen === undefined || seen.updated < ref.updated;
+};
+
+/** Its tool calls have not been read since it last changed. */
+const toolsDue = (store: Store, ref: SessionRef): boolean => {
+  const seen = store.tools[ref.id];
+  return seen === undefined || seen.toolsSynced < ref.updated;
+};
+
+const byNewest = (a: SessionRef, b: SessionRef): number => b.updated - a.updated || (a.id < b.id ? -1 : 1);
+
+/**
+ * The sessions to read first: any session changed in the last `RECENT_TOOLS_DAYS` days whose
+ * buckets or tool calls are not current, newest first. Reading one fills both, so a recent session
+ * that was never read is read once. Older history waits behind them.
+ */
+export const selectRecentSessions = (refs: SessionRef[], store: Store, options: { now: number; max: number }): SessionRef[] => {
+  const since = options.now - RECENT_TOOLS_DAYS * DAY_MS;
+  return refs
+    .filter((ref) => ref.updated >= since && (mainDue(store, ref) || toolsDue(store, ref)))
+    .sort(byNewest)
+    .slice(0, Math.max(0, options.max));
+};
+
+/** Sessions whose buckets are current but whose tool calls are not, newest first. */
+export const selectToolSessions = (refs: SessionRef[], store: Store, options: { max: number }): SessionRef[] => (
+  refs.filter((ref) => toolsDue(store, ref)).sort(byNewest).slice(0, Math.max(0, options.max))
+);
+
+/** How many sessions in the listing still have no current tool calls. */
+export const countToolsPending = (refs: SessionRef[], store: Store): number => refs.filter((ref) => toolsDue(store, ref)).length;
+
 export const emptyStore = (): Store => ({
   version: STORE_VERSION,
   watermark: 0,
@@ -346,6 +428,8 @@ export const emptyStore = (): Store => ({
   lastError: null,
   pending: 0,
   sessions: {},
+  tools: {},
+  toolsPending: 0,
   balances: {},
   ollamaUsage: null,
   budgets: {},
@@ -365,6 +449,13 @@ export const pruneStore = (store: Store, now: number): void => {
       if (!parsed || parsed.date < cutoffDate) delete entry.buckets[key];
     }
   }
+  // Tool rows keep the same retention; the marker stays so the session is not read again.
+  for (const entry of Object.values(store.tools)) {
+    for (const key of Object.keys(entry.rows)) {
+      const parsed = parseToolKey(key);
+      if (!parsed || parsed.date < cutoffDate) delete entry.rows[key];
+    }
+  }
 };
 
 /**
@@ -381,6 +472,12 @@ export const capStoreSize = (store: Store, maxBytes: number = MAX_STORE_BYTES): 
       if (parsed) dates.add(parsed.date);
     }
   }
+  for (const entry of Object.values(store.tools)) {
+    for (const key of Object.keys(entry.rows)) {
+      const parsed = parseToolKey(key);
+      if (parsed) dates.add(parsed.date);
+    }
+  }
   const ordered = [...dates].sort();
   let dropped = 0;
   while (size > maxBytes && dropped < ordered.length) {
@@ -394,6 +491,12 @@ export const capStoreSize = (store: Store, maxBytes: number = MAX_STORE_BYTES): 
         if (parsed && cut.has(parsed.date)) delete entry.buckets[key];
       }
     }
+    for (const entry of Object.values(store.tools)) {
+      for (const key of Object.keys(entry.rows)) {
+        const parsed = parseToolKey(key);
+        if (parsed && cut.has(parsed.date)) delete entry.rows[key];
+      }
+    }
     dropped = upTo;
     size = JSON.stringify(store).length;
   }
@@ -404,8 +507,41 @@ export const capStoreSize = (store: Store, maxBytes: number = MAX_STORE_BYTES): 
 export const applySession = (store: Store, ref: SessionRef, messages: unknown[]): void => {
   const project = projectKeyOf(ref.directory, store.settings.roots);
   const { buckets } = aggregateMessages(messages, project, ref.agent ?? null);
-  store.sessions[ref.id] = { updated: ref.updated, project, ...directoryField(ref.directory), buckets };
+  store.sessions[ref.id] = { updated: ref.updated, project, ...directoryField(ref.directory), ...parentField(ref.parent), buckets };
+  // The same read fills in the tool calls, so a session read for its buckets is not read again for them.
+  store.tools[ref.id] = { toolsSynced: ref.updated, rows: aggregateTools(messages) };
   if (ref.updated > store.watermark) store.watermark = ref.updated;
+};
+
+/** The tool calls of a session whose buckets are already current: nothing else in the store changes. */
+export const applyToolsOnly = (store: Store, ref: SessionRef, messages: unknown[]): void => {
+  store.tools[ref.id] = { toolsSynced: ref.updated, rows: aggregateTools(messages) };
+};
+
+/** OpenCode refused this session's messages for good: its tool calls are settled as none, until it changes. */
+export const applySkippedTools = (store: Store, ref: SessionRef): void => {
+  store.tools[ref.id] = { toolsSynced: ref.updated, rows: {} };
+};
+
+const parentField = (parent: string | null | undefined): { parent?: string } => (
+  typeof parent === 'string' && parent.trim() !== '' ? { parent: parent.trim().slice(0, 200) } : {}
+);
+
+/**
+ * Mark sessions as subagent sessions from the listing alone, with no message read. Only a parent the
+ * listing names is recorded; a missing field is not evidence that a session has no parent, so an
+ * existing mark is never cleared. Returns how many sessions were newly marked.
+ */
+export const markParents = (store: Store, refs: SessionRef[]): number => {
+  let marked = 0;
+  for (const ref of refs) {
+    const entry = store.sessions[ref.id];
+    const parent = parentField(ref.parent).parent;
+    if (!entry || parent === undefined || entry.parent === parent) continue;
+    entry.parent = parent;
+    marked += 1;
+  }
+  return marked;
 };
 
 const directoryField = (directory: string | null | undefined): { directory?: string } => (
@@ -414,8 +550,9 @@ const directoryField = (directory: string | null | undefined): { directory?: str
 
 export const applySkippedSession = (store: Store, ref: SessionRef, reason: string): void => {
   store.sessions[ref.id] = {
-    updated: ref.updated, project: projectKeyOf(ref.directory, store.settings.roots), ...directoryField(ref.directory), buckets: {}, skipped: reason,
+    updated: ref.updated, project: projectKeyOf(ref.directory, store.settings.roots), ...directoryField(ref.directory), ...parentField(ref.parent), buckets: {}, skipped: reason,
   };
+  applySkippedTools(store, ref);
   if (ref.updated > store.watermark) store.watermark = ref.updated;
 };
 
@@ -698,6 +835,89 @@ export const collapsedProjects = (store: Store): PanelPayload['collapsedProjects
   return store.settings.collapsed.map((project) => ({ project, parent: parents.get(project) ?? null, messages: replies.get(project) ?? 0 }));
 };
 
+// ---- Surfaces -----------------------------------------------------------
+
+/** Rows shown for skills, MCP servers and other tools; subagent types show fewer. */
+export const SURFACE_TOP = 10;
+export const SUBAGENT_TYPES_TOP = 5;
+
+type ToolEntry = ParsedToolKey & { row: ToolRow };
+
+/** Every stored tool row, parsed once; a row whose key cannot be read is not part of any figure. */
+const toolEntries = (store: Store, today: string): ToolEntry[] => {
+  const out: ToolEntry[] = [];
+  for (const entry of Object.values(store.tools)) {
+    for (const [key, row] of Object.entries(entry.rows)) {
+      const parsed = parseToolKey(key);
+      if (parsed && parsed.date <= today) out.push({ ...parsed, row });
+    }
+  }
+  return out;
+};
+
+/** Most context first, then tokens written, then calls, then name: what a tool put into the conversation is what costs later. */
+const bySurface = (a: SurfaceRow, b: SurfaceRow): number => (
+  b.contextChars - a.contextChars || b.generated - a.generated || b.calls - a.calls || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0)
+);
+
+/** Spend, tokens, replies and sessions of the subagent sessions inside a date range. Their buckets are the same ones the totals sum. */
+const subagentTotals = (store: Store, from: string, to: string): { cost: number; tokens: number; messages: number; sessions: number } => {
+  const out = { cost: 0, tokens: 0, messages: 0, sessions: 0 };
+  for (const entry of Object.values(store.sessions)) {
+    if (entry.parent === undefined) continue;
+    let touched = false;
+    for (const [key, bucket] of Object.entries(entry.buckets)) {
+      const parsed = parseBucketKey(key);
+      if (!parsed || parsed.date < from || parsed.date > to) continue;
+      out.cost += bucket.cost;
+      out.tokens += totalTokens(bucket.tokens);
+      out.messages += bucket.messages;
+      touched = true;
+    }
+    if (touched) out.sessions += 1;
+  }
+  return out;
+};
+
+/** The Surfaces figures for one period. Pure: the same rows and range always give the same answer. */
+export const buildSurfaces = (
+  entries: ToolEntry[],
+  subagent: { cost: number; tokens: number; messages: number; sessions: number },
+  range: { from: string; to: string },
+  totals: { cost: number; messages: number },
+): PeriodSurfaces => {
+  const groups = { skill: new Map<string, SurfaceRow>(), mcp: new Map<string, SurfaceRow>(), agent: new Map<string, SurfaceRow>(), tool: new Map<string, SurfaceRow>() };
+  let calls = 0;
+  let contextChars = 0;
+  for (const { date, cls, name, row } of entries) {
+    if (date < range.from || date > range.to) continue;
+    calls += row.calls;
+    contextChars += row.contextChars;
+    const map = groups[cls];
+    const into = map.get(name) ?? { name, calls: 0, generated: 0, contextChars: 0 };
+    map.set(name, into);
+    into.calls += row.calls;
+    into.generated += row.generated;
+    into.contextChars += row.contextChars;
+  }
+  const ranked = (map: Map<string, SurfaceRow>, top: number): SurfaceRow[] => [...map.values()].sort(bySurface).slice(0, top);
+  const dispatches = [...groups.agent.values()].reduce((sum, r) => sum + r.calls, 0);
+  return {
+    calls,
+    contextChars,
+    skills: ranked(groups.skill, SURFACE_TOP),
+    mcp: ranked(groups.mcp, SURFACE_TOP),
+    other: ranked(groups.tool, SURFACE_TOP),
+    subagents: {
+      dispatches,
+      types: [...groups.agent.values()].sort((a, b) => b.calls - a.calls || bySurface(a, b)).slice(0, SUBAGENT_TYPES_TOP),
+      ...subagent,
+      share: totals.cost > 0 ? (subagent.cost / totals.cost) * 100 : null,
+      replyShare: totals.messages > 0 ? (subagent.messages / totals.messages) * 100 : null,
+    },
+  };
+};
+
 export type LedgerView = Pick<PanelPayload, 'firstDate' | 'periods' | 'months' | 'hasData'> & {
   /** Spend for today, 7 and 30 days, for the status rows and the quota card. */
   totals: { today: RangeTotals; d7: RangeTotals; d30: RangeTotals };
@@ -715,6 +935,7 @@ const toTotals = (acc: Accumulator): RangeTotals => ({ cost: acc.cost, tokens: a
 export const deriveLedger = (store: Store, now: number): LedgerView => {
   const merged = mergeSessions(store);
   const today = dateKey(now);
+  const tools = toolEntries(store, today);
   const settings: LedgerSettings = store.settings;
   const parents = parentMap(store);
   const collapsed = new Set(settings.collapsed);
@@ -852,6 +1073,7 @@ export const deriveLedger = (store: Store, now: number): LedgerView => {
       projects: ranked.projects,
       unattributed: ranked.unattributed,
       types: buildTypes(inPeriod, total.cost, total.messages),
+      surfaces: buildSurfaces(tools, subagentTotals(store, from, to), { from, to }, total),
       granularity,
       series: [...series.values()],
     };

@@ -15,7 +15,7 @@ import type { Handle } from '@openchamber/sdk/ui';
 
 import { DASH, ago, agoLong, compact, money, monthName, parseCap, percent, pricePerMillion, providerName, resetIn, shareText, shortDate, tokensPerSecond } from '../shared/format.ts';
 import { CATEGORY_HINTS, CATEGORY_LABELS, PERIOD_IDS, PERIOD_LABELS } from '../shared/types.ts';
-import type { BalanceCard, BudgetResult, BudgetRow, ExportResult, LedgerSettings, MonthRow, PanelPayload, PeriodId, PeriodProject, PeriodView, SettingsResult, SyncResult, TypeCategoryRow } from '../shared/types.ts';
+import type { BalanceCard, BudgetResult, BudgetRow, ExportResult, LedgerSettings, MonthRow, PanelPayload, PeriodId, PeriodProject, PeriodView, SettingsResult, SurfaceRow, SyncResult, TypeCategoryRow } from '../shared/types.ts';
 
 const host = connectHost();
 const root = document.querySelector<HTMLElement>('#root');
@@ -64,7 +64,7 @@ root.append(head, bannerSlot, stateSlot, bodySlot, footSlot);
 
 let payload: PanelPayload | null = null;
 let period: PeriodId = 'd7';
-type View = 'spend' | 'clients' | 'types' | 'settings';
+type View = 'spend' | 'clients' | 'types' | 'surfaces' | 'settings';
 let activeView: View = 'spend';
 /** The settings fields as typed, one entry per line, kept across refreshes until saved or reset; null means "as stored". */
 let settingsDraft: Record<SettingsField, string> | null = null;
@@ -513,6 +513,10 @@ const typesBlock = (view3: PeriodView): HTMLElement => {
       ? `Uncategorised: ${replies(un.messages)}.`
       : `Uncategorised: ${replies(un.messages)}, ${shareText(un.replyShare)} of the period\u2019s replies. The agent behind them could not be read, so they are not guessed.`));
   }
+  const sub = view3.surfaces.subagents;
+  if (sub.sessions > 0) {
+    section.appendChild(h('p', 'pl-cap', `Subagent sessions: ${sub.share === null ? replies(sub.messages) : `${money(sub.cost)} · ${shareText(sub.share)} of the period\u2019s spend`}. Already counted in the rows above, not added to them.`));
+  }
   return section;
 };
 
@@ -560,6 +564,123 @@ const categoryProviders = (view3: PeriodView): HTMLElement => {
     section.appendChild(block);
   }
   return section;
+};
+
+// ---- Surfaces -------------------------------------------------------------
+
+const GENERATED_HINT = 'Tokens written while calling it';
+const CONTEXT_HINT = 'Characters it put into the conversation, re-read on later steps';
+const NO_BILL = 'No provider bills per tool: these are the tokens written while calling a tool and the context it added.';
+
+const chars = (n: number): string => `${n.toLocaleString('en-US')} characters`;
+
+const surfaceTable = (rows: SurfaceRow[], nameLabel: string, callsLabel: string): HTMLElement => {
+  const table = h('table', 'pl-table pl-surface');
+  const headRow = h('tr');
+  headRow.append(
+    headerCell(nameLabel, `${nameLabel}, most context added first`),
+    headerCell(callsLabel, `${callsLabel} in the period`),
+    headerCell('Generated', GENERATED_HINT),
+    headerCell('Context added', CONTEXT_HINT),
+  );
+  const thead = h('thead');
+  thead.appendChild(headRow);
+  const tbody = h('tbody');
+  rows.forEach((row, index) => {
+    const tr = h('tr', 'main');
+    const first = h('td');
+    const line = h('div', 'pl-pname');
+    line.append(h('span', 'pl-rank', String(index + 1)), document.createTextNode(row.name));
+    first.appendChild(line);
+    first.title = `${row.name}: ${row.calls} ${row.calls === 1 ? 'call' : 'calls'}, ${compact(row.generated)} tokens written while calling it, ${chars(row.contextChars)} added.`;
+    const context = h('td', undefined, row.contextChars > 0 ? compact(row.contextChars) : DASH);
+    context.title = row.contextChars > 0 ? chars(row.contextChars) : 'It returned no text';
+    const generated = h('td', undefined, row.generated > 0 ? compact(row.generated) : DASH);
+    generated.title = `${row.generated.toLocaleString('en-US')} tokens`;
+    tr.append(first, h('td', undefined, compact(row.calls)), generated, context);
+    tbody.appendChild(tr);
+  });
+  table.append(thead, tbody);
+  const wrap = h('div', 'pl-scroll');
+  wrap.appendChild(table);
+  return wrap;
+};
+
+const surfaceSection = (title: string, rows: SurfaceRow[], empty: string, nameLabel: string, callsLabel = 'Calls'): HTMLElement => {
+  const section = h('div', 'pl-section');
+  section.appendChild(h('h2', 'pl-h', title));
+  section.appendChild(rows.length === 0 ? h('p', 'pl-cap', empty) : surfaceTable(rows, nameLabel, callsLabel));
+  return section;
+};
+
+const surfaceTotals = (view4: PeriodView): HTMLElement => {
+  const { surfaces } = view4;
+  const sub = surfaces.subagents;
+  const grid = h('div', 'pl-totals');
+  const calls = h('div', 'pl-card');
+  calls.append(h('div', 'k', 'Tool calls'), h('div', 'v', compact(surfaces.calls)), h('div', 's', view4.label.toLowerCase()));
+  const context = h('div', 'pl-card');
+  context.append(h('div', 'k', 'Context added'), h('div', 'v', compact(surfaces.contextChars)), h('div', 's', 'characters'));
+  const share = h('div', 'pl-card');
+  share.append(
+    h('div', 'k', 'Subagent share'),
+    h('div', 'v', sub.share === null ? DASH : shareText(sub.share)),
+    h('div', 's', sub.sessions === 0 ? 'no subagent sessions' : sub.share === null ? `${replies(sub.messages)}` : `${money(sub.cost)} of spend`),
+  );
+  grid.append(calls, context, share);
+  return grid;
+};
+
+const subagentBlock = (view4: PeriodView): HTMLElement => {
+  const sub = view4.surfaces.subagents;
+  if (sub.dispatches === 0 && sub.sessions === 0) {
+    const section = h('div', 'pl-section');
+    section.appendChild(h('h2', 'pl-h', `Subagents · ${view4.label}`));
+    section.appendChild(h('p', 'pl-cap', 'No subagents were dispatched in this period.'));
+    return section;
+  }
+  const section = surfaceSection(`Subagents · ${view4.label}`, sub.types, 'No dispatch was recorded, though subagent sessions ran.', 'Type', 'Dispatches');
+  const spent = sub.share === null
+    ? `${replies(sub.messages)} (no spend in this period)`
+    : `${money(sub.cost)} · ${shareText(sub.share)} of the period\u2019s spend · ${replies(sub.messages)}`;
+  section.appendChild(h('p', 'pl-cap', `${sub.dispatches} ${sub.dispatches === 1 ? 'dispatch' : 'dispatches'} started ${sub.sessions} ${sub.sessions === 1 ? 'session' : 'sessions'} with replies in this period: ${spent}. Already counted in the totals, not added to them.`));
+  return section;
+};
+
+const surfacesView = (data: PanelPayload, view4: PeriodView): HTMLElement[] => {
+  const head3 = h('div', 'pl-section');
+  head3.appendChild(h('h2', 'pl-h', data.toolsRead === 0 ? 'Surfaces' : `Surfaces · ${view4.label}`));
+  head3.appendChild(h('p', 'pl-standing', NO_BILL));
+  if (data.toolsRead === 0) {
+    head3.appendChild(h('p', 'pl-cap', data.toolsPending > 0
+      ? `Tool calls appear after the first sync of recent sessions. Reading now: ${compact(data.toolsPending)} sessions to go, newest first.`
+      : 'Tool calls appear after the first sync of recent sessions.'));
+    return [head3];
+  }
+  head3.appendChild(h('p', 'pl-cap', `Generated: ${GENERATED_HINT.charAt(0).toLowerCase()}${GENERATED_HINT.slice(1)}. Context added: ${CONTEXT_HINT.charAt(0).toLowerCase()}${CONTEXT_HINT.slice(1)}. A reply that calls several tools counts its tokens under each.`));
+  const parts: HTMLElement[] = [head3, periodControl(data, view4)];
+  if (data.toolsPending > 0) {
+    const note = h('div');
+    parts.push(note);
+    track(mountBanner(note, {
+      tone: 'info',
+      title: 'Reading tool calls',
+      body: `${compact(data.toolsPending)} sessions to go, newest first, so older periods are partial.`,
+    }));
+  }
+  const s = view4.surfaces;
+  if (s.calls === 0 && s.subagents.sessions === 0) {
+    parts.push(h('p', 'pl-cap', 'No tool calls in this period.'));
+    return parts;
+  }
+  parts.push(
+    surfaceTotals(view4),
+    surfaceSection(`Skills · ${view4.label}`, s.skills, 'No skill was loaded in this period.', 'Skill'),
+    surfaceSection(`MCP servers · ${view4.label}`, s.mcp, 'No MCP server was called in this period, or its tools do not use the mcp_<server>_<tool> names.', 'Server'),
+    subagentBlock(view4),
+    surfaceSection(`Other tools · ${view4.label}`, s.other, 'No other tool was called in this period.', 'Tool'),
+  );
+  return parts;
 };
 
 // ---- Settings -------------------------------------------------------------
@@ -656,7 +777,7 @@ const viewTabs = (): HTMLElement => {
   const slot = h('div');
   wrap.appendChild(slot);
   track(mountTabs(slot, {
-    items: [{ id: 'spend', label: 'Spend' }, { id: 'clients', label: 'Clients' }, { id: 'types', label: 'Types' }, { id: 'settings', label: 'Settings' }],
+    items: [{ id: 'spend', label: 'Spend' }, { id: 'clients', label: 'Clients' }, { id: 'types', label: 'Types' }, { id: 'surfaces', label: 'Surfaces' }, { id: 'settings', label: 'Settings' }],
     activeId: activeView,
     trackBackground: true,
     onChange: (id) => {
@@ -1048,6 +1169,8 @@ const render = (): void => {
     bodySlot.append(periodControl(data, periodView), totalsRow(periodView), clientsBlock(periodView, data));
   } else if (view === 'types') {
     bodySlot.append(periodControl(data, periodView), totalsRow(periodView), typesBlock(periodView), scopeBlock(periodView), categoryProviders(periodView));
+  } else if (view === 'surfaces') {
+    bodySlot.append(...surfacesView(data, periodView));
   } else if (view === 'settings') {
     bodySlot.appendChild(settingsBlock(data));
   } else {

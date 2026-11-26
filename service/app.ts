@@ -76,7 +76,7 @@ export const createService = async (options: ServiceOptions) => {
     lastAttemptAt = now();
     if (!reader) {
       store.lastError = MISSING_OPENCODE;
-      return { processed: 0, pending: store.pending, error: MISSING_OPENCODE, listed: false };
+      return { processed: 0, pending: store.pending, toolsPending: store.toolsPending, error: MISSING_OPENCODE, listed: false };
     }
     syncing = true;
     try {
@@ -84,7 +84,7 @@ export const createService = async (options: ServiceOptions) => {
     } catch (error) {
       const message = error instanceof Error ? error.message : 'sync failed';
       store.lastError = message;
-      return { processed: 0, pending: store.pending, error: message, listed: false };
+      return { processed: 0, pending: store.pending, toolsPending: store.toolsPending, error: message, listed: false };
     } finally {
       syncing = false;
       version += 1;
@@ -100,7 +100,7 @@ export const createService = async (options: ServiceOptions) => {
       try {
         for (let i = 0; i < CHAIN_MAX; i += 1) {
           const outcome = await runBatch();
-          if (!outcome || !outcome.listed || outcome.error || outcome.pending === 0) break;
+          if (!outcome || !outcome.listed || outcome.error || (outcome.pending === 0 && outcome.toolsPending === 0)) break;
           await sleep(CHAIN_GAP_MS);
         }
       } finally {
@@ -113,7 +113,7 @@ export const createService = async (options: ServiceOptions) => {
     if (!autoSync || syncing || chaining) return;
     const at = now();
     if (at - lastAttemptAt < ATTEMPT_GAP_MS) return;
-    if (store.syncedAt === null || at - store.syncedAt > SYNC_EVERY_MS || store.pending > 0) startChain();
+    if (store.syncedAt === null || at - store.syncedAt > SYNC_EVERY_MS || store.pending > 0 || store.toolsPending > 0) startChain();
   };
 
   const panelPayload = (): PanelPayload => {
@@ -140,6 +140,8 @@ export const createService = async (options: ServiceOptions) => {
       budgets,
       overCap: badgeCount(budgets) ?? 0,
       rebuilding: store.rebuilding === true,
+      toolsRead: Object.keys(store.tools).length,
+      toolsPending: store.toolsPending,
       settings: store.settings,
       defaults: defaultSettings(),
       collapsedProjects: collapsedProjects(store),
@@ -211,7 +213,7 @@ export const createService = async (options: ServiceOptions) => {
   const handleSync = async (): Promise<SyncResult> => {
     if (syncing) return { syncedAt: store.syncedAt, sessions: 0, pending: store.pending, running: true };
     const outcome = await runBatch();
-    if (outcome && outcome.listed && !outcome.error && outcome.pending > 0) startChain();
+    if (outcome && outcome.listed && !outcome.error && (outcome.pending > 0 || outcome.toolsPending > 0)) startChain();
     return {
       syncedAt: store.syncedAt,
       sessions: outcome?.processed ?? 0,

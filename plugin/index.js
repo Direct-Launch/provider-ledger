@@ -103,6 +103,87 @@ const summarise = (store, range, today) => {
   return { period, month, all, first };
 };
 
+// ---- Surfaces: what the tools called in the period put into the conversation ----
+// The same rules as the service (`service/tools.ts`, `buildSurfaces`); a test holds the two to one answer.
+
+const TOOL_CLASSES = ['skill', 'mcp', 'agent', 'tool'];
+const SURFACE_TOP = 3;
+
+/** `date|provider|model|class|name`: the class and the name carry no bar, a model id may. */
+const parseToolKey = (key) => {
+  const first = key.indexOf('|');
+  const second = first < 0 ? -1 : key.indexOf('|', first + 1);
+  const last = key.lastIndexOf('|');
+  const before = last < 0 ? -1 : key.lastIndexOf('|', last - 1);
+  if (first < 0 || second < 0 || before <= second || last <= before) return null;
+  const cls = key.slice(before + 1, last);
+  const name = key.slice(last + 1);
+  if (!TOOL_CLASSES.includes(cls) || name === '') return null;
+  return { date: key.slice(0, first), cls, name };
+};
+
+const bySurface = (a, b) => b.contextChars - a.contextChars || b.generated - a.generated || b.calls - a.calls || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
+
+/** Skills, MCP servers and the subagent share for a range; null when no tool call was ever read. */
+const surfacesOf = (store, range, today, totals) => {
+  const sessions = Object.values(store.sessions ?? {});
+  const toolSessions = Object.values(store.tools ?? {}).filter((t) => t && typeof t === 'object' && t.rows && typeof t.rows === 'object');
+  if (toolSessions.length === 0) return null;
+  const groups = { skill: new Map(), mcp: new Map(), agent: new Map(), tool: new Map() };
+  let calls = 0;
+  for (const entry of toolSessions) {
+    for (const [key, row] of Object.entries(entry.rows)) {
+      const parsed = parseToolKey(key);
+      if (!parsed || parsed.date > today || parsed.date < range.from || parsed.date > range.to) continue;
+      const into = groups[parsed.cls].get(parsed.name) ?? { name: parsed.name, calls: 0, generated: 0, contextChars: 0 };
+      groups[parsed.cls].set(parsed.name, into);
+      into.calls += Number(row.calls) || 0;
+      into.generated += Number(row.generated) || 0;
+      into.contextChars += Number(row.contextChars) || 0;
+      calls += Number(row.calls) || 0;
+    }
+  }
+  const sub = { cost: 0, messages: 0, sessions: 0 };
+  for (const entry of sessions) {
+    if (typeof entry?.parent !== 'string' || entry.parent === '') continue;
+    let touched = false;
+    for (const [key, bucket] of Object.entries(entry.buckets ?? {})) {
+      const a = key.indexOf('|');
+      const date = a < 0 ? '' : key.slice(0, a);
+      if (date < range.from || date > range.to || date > today) continue;
+      sub.cost += Number(bucket.cost) || 0;
+      sub.messages += Number(bucket.messages) || 0;
+      touched = true;
+    }
+    if (touched) sub.sessions += 1;
+  }
+  const top = (map) => [...map.values()].sort(bySurface).slice(0, SURFACE_TOP);
+  const dispatches = [...groups.agent.values()].reduce((n, r) => n + r.calls, 0);
+  return {
+    calls,
+    skills: top(groups.skill),
+    mcp: top(groups.mcp),
+    dispatches,
+    sub,
+    share: totals.cost > 0 ? (sub.cost / totals.cost) * 100 : null,
+    replyShare: totals.messages > 0 ? (sub.messages / totals.messages) * 100 : null,
+  };
+};
+
+const surfaceLines = (store, range, today, totals) => {
+  const s = surfacesOf(store, range, today, totals);
+  if (s === null) return ['Surfaces: tool calls have not been read yet (the first sync reads recent sessions first).'];
+  if (s.calls === 0 && s.sub.sessions === 0) return ['Surfaces: no tool calls in this period.'];
+  const list = (rows) => rows.map((r) => `${r.name} ${r.calls} ${r.calls === 1 ? 'call' : 'calls'}, ${compact(r.contextChars)} chars`).join('; ');
+  const lines = [];
+  lines.push(`Surfaces, top skills: ${s.skills.length > 0 ? list(s.skills) : 'none'}. Top MCP servers: ${s.mcp.length > 0 ? list(s.mcp) : 'none'}.`);
+  const share = s.share !== null ? `${pct(s.share)} of spend (${money(s.sub.cost)})` : s.replyShare !== null ? `${pct(s.replyShare)} of replies` : 'no replies';
+  lines.push(`Subagents: ${s.dispatches} ${s.dispatches === 1 ? 'dispatch' : 'dispatches'}, ${s.sub.sessions} ${s.sub.sessions === 1 ? 'session' : 'sessions'} with ${share}, already inside the totals above. Chars are what a tool put into the conversation; no provider bills per tool.`);
+  const pending = Number(store.toolsPending) || 0;
+  if (pending > 0) lines.push(`Surfaces are partial: ${pending} sessions are still being read for tool calls.`);
+  return lines;
+};
+
 const bestBalance = (balances, provider) => {
   const account = accountOf(provider);
   let best = null;
@@ -225,6 +306,7 @@ const answer = async (input, now) => {
     const spent = month.get(id)?.cost ?? 0;
     lines.push(`${nameOf(id)} (${id}): ${budgetLine(spent, caps[id])} ${balanceLine(bestBalance(balances, id), now)}`);
   }
+  lines.push(...surfaceLines(store, range, today, total));
   if (store.rebuilding === true) lines.push('Note: the history is being re-read after an upgrade, so these figures are partial until it finishes.');
   return lines.join('\n');
 };
@@ -235,7 +317,7 @@ export default {
     await ctx.tool.transform((tools) => {
       tools.add({
         name: 'provider_ledger',
-        description: 'What the model providers cost and what is left on them, from the Provider Ledger extension. Answers a short text: spend, replies and tokens for a period, the top three providers by spend, and for the named provider (or every one that has a monthly cap or a readable balance) its balance windows and its budget state this UTC month. Read-only. Use it to check a budget or a balance before a long or expensive run, or to answer "what has this cost".',
+        description: 'What the model providers cost and what is left on them, from the Provider Ledger extension. Answers a short text: spend, replies and tokens for a period, the top three providers by spend, a Surfaces line (the top three skills and MCP servers by what they put into the conversation, and the subagent share of spend), and for the named provider (or every one that has a monthly cap or a readable balance) its balance windows and its budget state this UTC month. Read-only. Use it to check a budget or a balance before a long or expensive run, or to answer "what has this cost".',
         input: {
           type: 'object',
           properties: {

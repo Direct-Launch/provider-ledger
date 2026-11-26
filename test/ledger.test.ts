@@ -444,7 +444,9 @@ describe('balance cards', () => {
 describe('syncOnce failure handling', () => {
   test('a transient failure ends the run and leaves the rest pending', async () => {
     const store = emptyStore();
-    const refs = [{ id: 'a', updated: NOW - 3000 }, { id: 'b', updated: NOW - 2000 }, { id: 'c', updated: NOW - 1000 }];
+    // Older than 30 days, so they are read oldest first; the newest-first order of recent sessions is in tools.test.ts.
+    const old = NOW - 90 * DAY_MS;
+    const refs = [{ id: 'a', updated: old - 3000 }, { id: 'b', updated: old - 2000 }, { id: 'c', updated: old - 1000 }];
     const reader: OpenCodeReader = {
       listSessions: async () => refs,
       listMessages: async (id) => {
@@ -516,7 +518,7 @@ describe('OpenCode response shapes', () => {
   });
 
   test('reads a session ref from time.updated, seconds or ISO', () => {
-    expect(sessionRefOf({ id: 's', time: { updated: NOW } })).toEqual({ id: 's', updated: NOW, directory: null, agent: null });
+    expect(sessionRefOf({ id: 's', time: { updated: NOW } })).toEqual({ id: 's', updated: NOW, directory: null, agent: null, parent: null });
     expect(sessionRefOf({ id: 's', time: { updated: NOW / 1000 } })?.updated).toBe(Math.round(NOW));
     expect(sessionRefOf({ id: 's', time: { updated: '2026-11-26T12:00:00Z' } })?.updated).toBe(NOW);
     expect(sessionRefOf({ time: { updated: NOW } })).toBeNull();

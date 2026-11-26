@@ -1,6 +1,6 @@
 {
   "name": "provider-ledger",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "private": true,
   "type": "module",
   "description": "What each model provider costs, what it was for, how fast it is, and what is left on it.",

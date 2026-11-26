@@ -27,9 +27,30 @@ export type SessionEntry = {
   project?: string;
   /** The directory the session ran in, so a change of workspace roots can re-key it without reading a message. */
   directory?: string;
+  /** The session this one was spawned from, when OpenCode says so: it is a subagent session. */
+  parent?: string;
   buckets: Record<string, Bucket>;
   /** Set when OpenCode refused this session's messages for good (4xx); retried only once it changes. */
   skipped?: string;
+};
+
+/** What one tool did in one day's replies of one model: calls, tokens written while calling it, characters it returned. */
+export type ToolRow = {
+  calls: number;
+  /** Output and reasoning tokens of the replies that called it (once per reply, however many times it was called in it). */
+  generated: number;
+  /** Characters of the tool's returned text; 0 for a call that had not completed. */
+  contextChars: number;
+};
+
+/**
+ * One session's tool calls, keyed `date|provider|model|class|name`. `toolsSynced` is the
+ * session's `time.updated` when its messages were read for tools: the marker that lets an
+ * unchanged session be skipped and an interrupted backfill resume.
+ */
+export type SessionTools = {
+  toolsSynced: number;
+  rows: Record<string, ToolRow>;
 };
 
 export type WindowSnapshot = QuotaProviderWindow;
@@ -116,6 +137,13 @@ export type Store = {
   /** Sessions still waiting after the last run. */
   pending: number;
   sessions: Record<string, SessionEntry>;
+  /**
+   * Tool calls by session id. A second, resumable pass: it does not belong to the store version,
+   * so a store written before it simply starts with none and fills in newest first.
+   */
+  tools: Record<string, SessionTools>;
+  /** Sessions whose tool calls are still to be read. */
+  toolsPending: number;
   balances: Record<string, BalanceSnapshot>;
   ollamaUsage: OllamaUsage | null;
   /** Monthly caps in USD by provider id. A provider with no entry has no cap. */
@@ -204,6 +232,43 @@ export type PeriodTypes = {
   uncategorised: { messages: number; cost: number; replyShare: number | null };
 };
 
+/** One skill, MCP server, subagent type or other tool in a period. */
+export type SurfaceRow = {
+  name: string;
+  calls: number;
+  /** Tokens written (output and reasoning) in the replies that called it. */
+  generated: number;
+  /** Characters it put into the conversation. */
+  contextChars: number;
+};
+
+/** The Surfaces tab for one period. */
+export type PeriodSurfaces = {
+  /** Every tool call in the period, whatever its class. */
+  calls: number;
+  contextChars: number;
+  /** Top ten of each, most context added first. */
+  skills: SurfaceRow[];
+  mcp: SurfaceRow[];
+  other: SurfaceRow[];
+  subagents: {
+    /** Calls to the subagent tool. */
+    dispatches: number;
+    /** Top subagent types by dispatches. */
+    types: SurfaceRow[];
+    /** Sessions run by a subagent that have replies in the period. */
+    sessions: number;
+    /** Their spend, tokens and replies: already inside the period's totals, never added to them. */
+    cost: number;
+    tokens: number;
+    messages: number;
+    /** Percent of the period's spend; null when the period has no spend. */
+    share: number | null;
+    /** Percent of the period's replies. */
+    replyShare: number | null;
+  };
+};
+
 /** One bar: a UTC day (`YYYY-MM-DD`) or a UTC month (`YYYY-MM`). */
 export type SeriesPoint = {
   key: string;
@@ -228,6 +293,7 @@ export type PeriodView = {
   unattributed: PeriodProject;
   /** Spend by category and by scope. */
   types: PeriodTypes;
+  surfaces: PeriodSurfaces;
   granularity: 'day' | 'month';
   series: SeriesPoint[];
 };
@@ -299,6 +365,9 @@ export type PanelPayload = {
   overCap: number;
   /** The history is being read again after an upgrade: figures are partial until `pending` reaches 0. */
   rebuilding: boolean;
+  /** Sessions whose tool calls have been read, and how many are still to be. */
+  toolsRead: number;
+  toolsPending: number;
   settings: LedgerSettings;
   defaults: LedgerSettings;
   /** Folders merged into a parent, so they can be restored. */

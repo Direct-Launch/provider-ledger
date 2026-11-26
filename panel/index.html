@@ -95,6 +95,8 @@
       .pl-link:focus-visible { outline: 2px solid var(--oc-primary); outline-offset: 2px; border-radius: 2px; }
       .pl-totals.two { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .pl-subtitle { font-size: 12px; font-weight: 600; }
+      .pl-standing { margin: 0; font-size: 12px; font-weight: 600; color: var(--oc-fg); }
+      .pl-surface td:first-child { width: 42%; }
       .pl-tag { margin-left: 6px; padding: 0 6px; font-size: 10px; line-height: 16px; border: 1px solid var(--oc-border); border-radius: 8px; color: var(--oc-muted); }
       .pl-form { display: flex; flex-direction: column; gap: 12px; }
       .pl-field { display: flex; flex-direction: column; gap: 4px; }
@@ -111,6 +113,7 @@
         .pl-table .col-tokens { display: none; }
         .pl-table th { white-space: normal; line-height: 1.2; vertical-align: bottom; }
         .pl-table .pl-rank { display: none; }
+        .pl-surface th, .pl-surface td { padding-left: 4px; padding-right: 4px; }
         .pl-sub { padding-left: 0; }
         .pl-bar.mini { margin-left: 0; width: 100%; }
         .pl-period .oc-sdk-tabs { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); }

@@ -432,13 +432,91 @@ var resetRules = (current) => ({
   collapsed: [...current.collapsed]
 });
 
+// service/tools.ts
+var isObject = (value) => typeof value === "object" && value !== null && !Array.isArray(value);
+var str = (value) => typeof value === "string" && value.trim() !== "" ? value.trim() : null;
+var SKILL_TOOL = "skill";
+var SUBAGENT_TOOLS = new Set(["task", "subagent"]);
+var MCP_NAME = /^mcp_([^_\s]+)_(.+)$/;
+var classifyTool = (toolName, input) => {
+  const own = (cls, name) => {
+    const cleaned = name === null ? "" : cleanKey(name);
+    return cleaned === "" ? { cls: "tool", name: cleanKey(toolName) || "unnamed" } : { cls, name: cleaned };
+  };
+  const fields = isObject(input) ? input : {};
+  if (toolName === SKILL_TOOL)
+    return own("skill", str(fields.name) ?? str(fields.id));
+  if (SUBAGENT_TOOLS.has(toolName))
+    return own("agent", str(fields.subagent_type) ?? str(fields.agent));
+  const mcp = MCP_NAME.exec(toolName);
+  if (mcp)
+    return own("mcp", mcp[1] ?? null);
+  return own("tool", toolName);
+};
+var resultChars = (state) => {
+  if (state.status !== "completed")
+    return 0;
+  let total = 0;
+  if (Array.isArray(state.content)) {
+    for (const entry of state.content) {
+      if (isObject(entry) && entry.type === "text" && typeof entry.text === "string")
+        total += entry.text.length;
+    }
+  } else if (typeof state.output === "string") {
+    total += state.output.length;
+  }
+  return total;
+};
+var toolCallsOf = (raw) => {
+  if (!isObject(raw))
+    return [];
+  const info = isObject(raw.info) ? raw.info : raw;
+  const lists = [raw.content, info.content, raw.parts].filter(Array.isArray);
+  const calls = [];
+  const seen = new Set;
+  for (const list of lists) {
+    for (const part of list) {
+      if (!isObject(part) || part.type !== "tool")
+        continue;
+      const name = str(part.name) ?? str(part.tool);
+      if (name === null)
+        continue;
+      const id = str(part.id) ?? str(part.callID);
+      if (id !== null) {
+        if (seen.has(id))
+          continue;
+        seen.add(id);
+      }
+      const state = isObject(part.state) ? part.state : {};
+      calls.push({ ...classifyTool(name, state.input), contextChars: resultChars(state) });
+    }
+  }
+  return calls;
+};
+var toolKey = (date, provider, model, cls, name) => `${date}|${provider}|${model}|${cls}|${name}`;
+var CLASSES = new Set(["skill", "mcp", "agent", "tool"]);
+var parseToolKey = (key) => {
+  const first = key.indexOf("|");
+  const second = first < 0 ? -1 : key.indexOf("|", first + 1);
+  const last = key.lastIndexOf("|");
+  const before = last < 0 ? -1 : key.lastIndexOf("|", last - 1);
+  if (first < 0 || second < 0 || before <= second || last <= before)
+    return null;
+  const cls = key.slice(before + 1, last);
+  const name = key.slice(last + 1);
+  if (!CLASSES.has(cls) || name === "")
+    return null;
+  return { date: key.slice(0, first), provider: key.slice(first + 1, second), model: key.slice(second + 1, before), cls, name };
+};
+
 // service/ledger.ts
 var RETENTION_DAYS = 3 * 366;
 var MAX_STORE_BYTES = 16 * 1024 * 1024;
 var MAX_SESSIONS_PER_RUN = 40;
+var RECENT_TOOLS_DAYS = 30;
 var SAMPLE_CAP = 300;
 var DAY_MS = 86400000;
-var isObject = (value) => typeof value === "object" && value !== null && !Array.isArray(value);
+var isObject2 = (value) => typeof value === "object" && value !== null && !Array.isArray(value);
 var num = (value) => {
   if (typeof value === "number" && Number.isFinite(value))
     return value;
@@ -446,7 +524,7 @@ var num = (value) => {
     return Number(value);
   return null;
 };
-var str = (value) => typeof value === "string" && value.trim() !== "" ? value.trim() : null;
+var str2 = (value) => typeof value === "string" && value.trim() !== "" ? value.trim() : null;
 var toEpochMs = (value) => {
   const n = num(value);
   if (n !== null)
@@ -494,30 +572,30 @@ var finishPercentiles = (bucket) => {
   bucket.p90 = p90 === null ? null : round(p90, 2);
 };
 var normalizeMessage = (raw) => {
-  if (!isObject(raw))
+  if (!isObject2(raw))
     return null;
-  const info = isObject(raw.info) ? raw.info : raw;
-  const role = str(info.role);
+  const info = isObject2(raw.info) ? raw.info : raw;
+  const role = str2(info.role);
   if (role !== null && role !== "assistant")
     return null;
-  const type = str(info.type);
+  const type = str2(info.type);
   if (type !== null && type !== "assistant")
     return null;
-  const model = isObject(info.model) ? info.model : null;
-  const provider = str(info.providerID) ?? (model ? str(model.providerID) : null);
-  const modelId = str(info.modelID) ?? (model ? str(model.modelID) ?? str(model.id) : null);
+  const model = isObject2(info.model) ? info.model : null;
+  const provider = str2(info.providerID) ?? (model ? str2(model.providerID) : null);
+  const modelId = str2(info.modelID) ?? (model ? str2(model.modelID) ?? str2(model.id) : null);
   if (!provider || !modelId)
     return null;
-  const tokensRaw = isObject(info.tokens) ? info.tokens : null;
+  const tokensRaw = isObject2(info.tokens) ? info.tokens : null;
   if (role === null && tokensRaw === null)
     return null;
-  const time = isObject(info.time) ? info.time : {};
+  const time = isObject2(info.time) ? info.time : {};
   const created = toEpochMs(time.created);
   const completed = toEpochMs(time.completed);
   const at = created ?? completed;
   if (at === null)
     return null;
-  const cache = tokensRaw && isObject(tokensRaw.cache) ? tokensRaw.cache : {};
+  const cache = tokensRaw && isObject2(tokensRaw.cache) ? tokensRaw.cache : {};
   const tokens = {
     input: Math.max(0, num(tokensRaw?.input) ?? 0),
     output: Math.max(0, num(tokensRaw?.output) ?? 0),
@@ -542,8 +620,8 @@ var normalizeMessage = (raw) => {
     agent: ownAgentOf(info)
   };
 };
-var ownAgentOf = (info) => str(info.agent) ?? str(info.mode);
-var agentId = (value) => typeof value === "string" ? str(value) : isObject(value) ? str(value.id) ?? str(value.name) : null;
+var ownAgentOf = (info) => str2(info.agent) ?? str2(info.mode);
+var agentId = (value) => typeof value === "string" ? str2(value) : isObject2(value) ? str2(value.id) ?? str2(value.name) : null;
 var agentKey = (agent) => {
   const cleaned = cleanKey(agent ?? "");
   return cleaned === "" ? UNKNOWN_AGENT : cleaned;
@@ -575,17 +653,17 @@ var rekeyBuckets = (buckets, project) => {
 };
 var newBucket = () => ({ messages: 0, tokens: emptyTokens(), cost: 0, samples: [], p50: null, p90: null });
 var switchOf = (raw) => {
-  if (!isObject(raw))
+  if (!isObject2(raw))
     return null;
-  const info = isObject(raw.info) ? raw.info : raw;
-  const type = str(info.type)?.toLowerCase().replace(/_/g, "-");
+  const info = isObject2(raw.info) ? raw.info : raw;
+  const type = str2(info.type)?.toLowerCase().replace(/_/g, "-");
   return type === "agent-switched" ? { agent: agentId(info.agent) } : null;
 };
 var timeOf = (raw) => {
-  if (!isObject(raw))
+  if (!isObject2(raw))
     return null;
-  const info = isObject(raw.info) ? raw.info : raw;
-  const time = isObject(info.time) ? info.time.created ?? info.time.completed : info.time;
+  const info = isObject2(raw.info) ? raw.info : raw;
+  const time = isObject2(info.time) ? info.time.created ?? info.time.completed : info.time;
   return toEpochMs(time ?? info.created ?? info.timestamp);
 };
 var inOrder = (messages) => {
@@ -635,6 +713,31 @@ var aggregateMessages = (messages, project = UNATTRIBUTED, sessionAgent = null) 
   }
   return { buckets, skipped };
 };
+var newToolRow = () => ({ calls: 0, generated: 0, contextChars: 0 });
+var aggregateTools = (messages) => {
+  const rows = {};
+  for (const raw of messages) {
+    const calls = toolCallsOf(raw);
+    if (calls.length === 0)
+      continue;
+    const m = normalizeMessage(raw);
+    if (!m)
+      continue;
+    const generated = m.tokens.output + m.tokens.reasoning;
+    const counted = new Set;
+    for (const call of calls) {
+      const key = toolKey(m.date, m.provider, m.model, call.cls, call.name);
+      const row = rows[key] ??= newToolRow();
+      row.calls += 1;
+      row.contextChars += call.contextChars;
+      if (!counted.has(key)) {
+        counted.add(key);
+        row.generated += generated;
+      }
+    }
+  }
+  return rows;
+};
 var selectSessions = (refs, known, options) => {
   const due = refs.filter((ref) => {
     const seen = known[ref.id];
@@ -643,6 +746,21 @@ var selectSessions = (refs, known, options) => {
   const max = options.max ?? MAX_SESSIONS_PER_RUN;
   return { selected: due.slice(0, max), pending: Math.max(0, due.length - max) };
 };
+var mainDue = (store, ref) => {
+  const seen = store.sessions[ref.id];
+  return seen === undefined || seen.updated < ref.updated;
+};
+var toolsDue = (store, ref) => {
+  const seen = store.tools[ref.id];
+  return seen === undefined || seen.toolsSynced < ref.updated;
+};
+var byNewest = (a, b) => b.updated - a.updated || (a.id < b.id ? -1 : 1);
+var selectRecentSessions = (refs, store, options) => {
+  const since = options.now - RECENT_TOOLS_DAYS * DAY_MS;
+  return refs.filter((ref) => ref.updated >= since && (mainDue(store, ref) || toolsDue(store, ref))).sort(byNewest).slice(0, Math.max(0, options.max));
+};
+var selectToolSessions = (refs, store, options) => refs.filter((ref) => toolsDue(store, ref)).sort(byNewest).slice(0, Math.max(0, options.max));
+var countToolsPending = (refs, store) => refs.filter((ref) => toolsDue(store, ref)).length;
 var emptyStore = () => ({
   version: STORE_VERSION,
   watermark: 0,
@@ -650,6 +768,8 @@ var emptyStore = () => ({
   lastError: null,
   pending: 0,
   sessions: {},
+  tools: {},
+  toolsPending: 0,
   balances: {},
   ollamaUsage: null,
   budgets: {},
@@ -664,6 +784,13 @@ var pruneStore = (store, now) => {
         delete entry.buckets[key];
     }
   }
+  for (const entry of Object.values(store.tools)) {
+    for (const key of Object.keys(entry.rows)) {
+      const parsed = parseToolKey(key);
+      if (!parsed || parsed.date < cutoffDate)
+        delete entry.rows[key];
+    }
+  }
 };
 var capStoreSize = (store, maxBytes = MAX_STORE_BYTES) => {
   let size = JSON.stringify(store).length;
@@ -673,6 +800,13 @@ var capStoreSize = (store, maxBytes = MAX_STORE_BYTES) => {
   for (const entry of Object.values(store.sessions)) {
     for (const key of Object.keys(entry.buckets)) {
       const parsed = parseBucketKey(key);
+      if (parsed)
+        dates.add(parsed.date);
+    }
+  }
+  for (const entry of Object.values(store.tools)) {
+    for (const key of Object.keys(entry.rows)) {
+      const parsed = parseToolKey(key);
       if (parsed)
         dates.add(parsed.date);
     }
@@ -690,6 +824,13 @@ var capStoreSize = (store, maxBytes = MAX_STORE_BYTES) => {
           delete entry.buckets[key];
       }
     }
+    for (const entry of Object.values(store.tools)) {
+      for (const key of Object.keys(entry.rows)) {
+        const parsed = parseToolKey(key);
+        if (parsed && cut.has(parsed.date))
+          delete entry.rows[key];
+      }
+    }
     dropped = upTo;
     size = JSON.stringify(store).length;
   }
@@ -698,9 +839,29 @@ var capStoreSize = (store, maxBytes = MAX_STORE_BYTES) => {
 var applySession = (store, ref, messages) => {
   const project = projectKeyOf(ref.directory, store.settings.roots);
   const { buckets } = aggregateMessages(messages, project, ref.agent ?? null);
-  store.sessions[ref.id] = { updated: ref.updated, project, ...directoryField(ref.directory), buckets };
+  store.sessions[ref.id] = { updated: ref.updated, project, ...directoryField(ref.directory), ...parentField(ref.parent), buckets };
+  store.tools[ref.id] = { toolsSynced: ref.updated, rows: aggregateTools(messages) };
   if (ref.updated > store.watermark)
     store.watermark = ref.updated;
+};
+var applyToolsOnly = (store, ref, messages) => {
+  store.tools[ref.id] = { toolsSynced: ref.updated, rows: aggregateTools(messages) };
+};
+var applySkippedTools = (store, ref) => {
+  store.tools[ref.id] = { toolsSynced: ref.updated, rows: {} };
+};
+var parentField = (parent) => typeof parent === "string" && parent.trim() !== "" ? { parent: parent.trim().slice(0, 200) } : {};
+var markParents = (store, refs) => {
+  let marked = 0;
+  for (const ref of refs) {
+    const entry = store.sessions[ref.id];
+    const parent = parentField(ref.parent).parent;
+    if (!entry || parent === undefined || entry.parent === parent)
+      continue;
+    entry.parent = parent;
+    marked += 1;
+  }
+  return marked;
 };
 var directoryField = (directory) => typeof directory === "string" && directory.trim() !== "" ? { directory: directory.trim().slice(0, 500) } : {};
 var applySkippedSession = (store, ref, reason) => {
@@ -708,9 +869,11 @@ var applySkippedSession = (store, ref, reason) => {
     updated: ref.updated,
     project: projectKeyOf(ref.directory, store.settings.roots),
     ...directoryField(ref.directory),
+    ...parentField(ref.parent),
     buckets: {},
     skipped: reason
   };
+  applySkippedTools(store, ref);
   if (ref.updated > store.watermark)
     store.watermark = ref.updated;
 };
@@ -938,10 +1101,78 @@ var collapsedProjects = (store) => {
   }
   return store.settings.collapsed.map((project) => ({ project, parent: parents.get(project) ?? null, messages: replies.get(project) ?? 0 }));
 };
+var SURFACE_TOP = 10;
+var SUBAGENT_TYPES_TOP = 5;
+var toolEntries = (store, today) => {
+  const out = [];
+  for (const entry of Object.values(store.tools)) {
+    for (const [key, row] of Object.entries(entry.rows)) {
+      const parsed = parseToolKey(key);
+      if (parsed && parsed.date <= today)
+        out.push({ ...parsed, row });
+    }
+  }
+  return out;
+};
+var bySurface = (a, b) => b.contextChars - a.contextChars || b.generated - a.generated || b.calls - a.calls || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
+var subagentTotals = (store, from, to) => {
+  const out = { cost: 0, tokens: 0, messages: 0, sessions: 0 };
+  for (const entry of Object.values(store.sessions)) {
+    if (entry.parent === undefined)
+      continue;
+    let touched = false;
+    for (const [key, bucket] of Object.entries(entry.buckets)) {
+      const parsed = parseBucketKey(key);
+      if (!parsed || parsed.date < from || parsed.date > to)
+        continue;
+      out.cost += bucket.cost;
+      out.tokens += totalTokens(bucket.tokens);
+      out.messages += bucket.messages;
+      touched = true;
+    }
+    if (touched)
+      out.sessions += 1;
+  }
+  return out;
+};
+var buildSurfaces = (entries, subagent, range, totals) => {
+  const groups = { skill: new Map, mcp: new Map, agent: new Map, tool: new Map };
+  let calls = 0;
+  let contextChars = 0;
+  for (const { date, cls, name, row } of entries) {
+    if (date < range.from || date > range.to)
+      continue;
+    calls += row.calls;
+    contextChars += row.contextChars;
+    const map = groups[cls];
+    const into = map.get(name) ?? { name, calls: 0, generated: 0, contextChars: 0 };
+    map.set(name, into);
+    into.calls += row.calls;
+    into.generated += row.generated;
+    into.contextChars += row.contextChars;
+  }
+  const ranked = (map, top) => [...map.values()].sort(bySurface).slice(0, top);
+  const dispatches = [...groups.agent.values()].reduce((sum, r) => sum + r.calls, 0);
+  return {
+    calls,
+    contextChars,
+    skills: ranked(groups.skill, SURFACE_TOP),
+    mcp: ranked(groups.mcp, SURFACE_TOP),
+    other: ranked(groups.tool, SURFACE_TOP),
+    subagents: {
+      dispatches,
+      types: [...groups.agent.values()].sort((a, b) => b.calls - a.calls || bySurface(a, b)).slice(0, SUBAGENT_TYPES_TOP),
+      ...subagent,
+      share: totals.cost > 0 ? subagent.cost / totals.cost * 100 : null,
+      replyShare: totals.messages > 0 ? subagent.messages / totals.messages * 100 : null
+    }
+  };
+};
 var toTotals = (acc) => ({ cost: acc.cost, tokens: acc.tokens, messages: acc.messages });
 var deriveLedger = (store, now) => {
   const merged = mergeSessions(store);
   const today = dateKey(now);
+  const tools = toolEntries(store, today);
   const settings = store.settings;
   const parents = parentMap(store);
   const collapsed = new Set(settings.collapsed);
@@ -1076,6 +1307,7 @@ var deriveLedger = (store, now) => {
       projects: ranked.projects,
       unattributed: ranked.unattributed,
       types: buildTypes(inPeriod, total.cost, total.messages),
+      surfaces: buildSurfaces(tools, subagentTotals(store, from, to), { from, to }, total),
       granularity,
       series: [...series.values()]
     };
@@ -1376,18 +1608,18 @@ class UpstreamError extends Error {
 }
 var REQUEST_TIMEOUT_MS = 20000;
 var MAX_PAGES = 400;
-var isObject2 = (value) => typeof value === "object" && value !== null && !Array.isArray(value);
+var isObject3 = (value) => typeof value === "object" && value !== null && !Array.isArray(value);
 var cursorOf = (raw) => {
   if (typeof raw === "string" && raw !== "")
     return raw;
-  if (isObject2(raw) && typeof raw.next === "string" && raw.next !== "")
+  if (isObject3(raw) && typeof raw.next === "string" && raw.next !== "")
     return raw.next;
   return null;
 };
 var unwrapList = (body) => {
   if (Array.isArray(body))
     return { items: body, cursor: null };
-  if (!isObject2(body))
+  if (!isObject3(body))
     return { items: [], cursor: null };
   const key = ["items", "data", "sessions", "messages", "results"].find((k) => Array.isArray(body[k]));
   const items = key ? body[key] : [];
@@ -1397,30 +1629,43 @@ var directoryOf = (raw) => {
   const direct = typeof raw.directory === "string" && raw.directory.trim() !== "" ? raw.directory : null;
   if (direct)
     return direct;
-  const location = isObject2(raw.location) ? raw.location : null;
+  const location = isObject3(raw.location) ? raw.location : null;
   return location && typeof location.directory === "string" && location.directory.trim() !== "" ? location.directory : null;
 };
 var agentOf = (raw) => {
   const value = raw.agent;
   if (typeof value === "string" && value.trim() !== "")
     return value.trim();
-  if (isObject2(value)) {
+  if (isObject3(value)) {
     const id = typeof value.id === "string" ? value.id : typeof value.name === "string" ? value.name : "";
     return id.trim() !== "" ? id.trim() : null;
   }
   return null;
 };
+var parentOf = (raw) => {
+  for (const key of ["parentID", "parentId", "parent_id"]) {
+    const value = raw[key];
+    if (typeof value === "string" && value.trim() !== "")
+      return value.trim();
+  }
+  const parent = raw.parent;
+  if (typeof parent === "string" && parent.trim() !== "")
+    return parent.trim();
+  if (isObject3(parent) && typeof parent.id === "string" && parent.id.trim() !== "")
+    return parent.id.trim();
+  return null;
+};
 var sessionRefOf = (raw) => {
-  if (!isObject2(raw))
+  if (!isObject3(raw))
     return null;
   const id = typeof raw.id === "string" && raw.id !== "" ? raw.id : null;
   if (!id)
     return null;
-  const time = isObject2(raw.time) ? raw.time : {};
+  const time = isObject3(raw.time) ? raw.time : {};
   const updated = toEpochMs(time.updated ?? raw.updatedAt ?? raw.updated ?? time.created ?? raw.createdAt);
   if (updated === null)
     return null;
-  return { id, updated, directory: directoryOf(raw), agent: agentOf(raw) };
+  return { id, updated, directory: directoryOf(raw), agent: agentOf(raw), parent: parentOf(raw) };
 };
 var createOpenCodeReader = (baseUrl, token, fetchFn = fetch) => {
   const base = baseUrl.replace(/\/+$/, "");
@@ -1477,37 +1722,53 @@ var syncOnce = async (store, reader, options) => {
   } catch (error2) {
     const message = error2 instanceof Error ? error2.message : "OpenCode session list failed";
     store.lastError = message;
-    return { processed: 0, pending: store.pending, error: message, listed: false };
+    return { processed: 0, pending: store.pending, toolsPending: store.toolsPending, error: message, listed: false };
   }
   reattributeSessions(store, refs);
-  const { selected, pending } = selectSessions(refs, store.sessions, {
-    max: options.maxSessions ?? MAX_SESSIONS_PER_RUN
-  });
+  markParents(store, refs);
+  const max = options.maxSessions ?? MAX_SESSIONS_PER_RUN;
   let processed = 0;
   let error = null;
-  let left = pending;
-  for (const [index, ref] of selected.entries()) {
-    try {
-      applySession(store, ref, await reader.listMessages(ref.id));
-      processed += 1;
-    } catch (caught) {
-      const message = caught instanceof Error ? caught.message : "OpenCode message read failed";
-      if (caught instanceof UpstreamError && !caught.transient) {
-        applySkippedSession(store, ref, message);
-        continue;
+  const readAll = async (batch) => {
+    for (const ref of batch) {
+      const buckets = store.sessions[ref.id];
+      const needsBuckets = buckets === undefined || buckets.updated < ref.updated;
+      try {
+        const messages = await reader.listMessages(ref.id);
+        if (needsBuckets)
+          applySession(store, ref, messages);
+        else
+          applyToolsOnly(store, ref, messages);
+        processed += 1;
+      } catch (caught) {
+        const message = caught instanceof Error ? caught.message : "OpenCode message read failed";
+        if (caught instanceof UpstreamError && !caught.transient) {
+          if (needsBuckets)
+            applySkippedSession(store, ref, message);
+          else
+            applySkippedTools(store, ref);
+          continue;
+        }
+        error = message;
+        return false;
       }
-      error = message;
-      left += selected.length - index;
-      break;
     }
-  }
+    return true;
+  };
+  let ok = await readAll(selectRecentSessions(refs, store, { now: options.now, max }));
+  if (ok)
+    ok = await readAll(selectSessions(refs, store.sessions, { max: Math.max(0, max - processed) }).selected);
+  if (ok)
+    await readAll(selectToolSessions(refs, store, { max: Math.max(0, max - processed) }));
+  const left = selectSessions(refs, store.sessions, { max: 0 }).pending;
   pruneStore(store, options.now);
   store.syncedAt = options.now;
   store.pending = left;
+  store.toolsPending = countToolsPending(refs, store);
   store.lastError = error;
   if (store.rebuilding && error === null && left === 0)
     delete store.rebuilding;
-  return { processed, pending: left, error, listed: true };
+  return { processed, pending: left, toolsPending: store.toolsPending, error, listed: true };
 };
 
 // service/providers.ts
@@ -1520,7 +1781,7 @@ var OLLAMA_USAGE_URL = "https://ollama.com/api/usage?range=7d&group_by=model";
 var DEEPSEEK_BALANCE_URL = "https://api.deepseek.com/user/balance";
 var MICRO_CENTS_PER_DOLLAR = 1e8;
 var GO_PRODUCTS = { go: "Go", "go-plus": "Go Plus", "go-teams": "Go Teams" };
-var isObject3 = (value) => typeof value === "object" && value !== null && !Array.isArray(value);
+var isObject4 = (value) => typeof value === "object" && value !== null && !Array.isArray(value);
 var num2 = (value) => {
   if (typeof value === "number" && Number.isFinite(value))
     return value;
@@ -1541,14 +1802,14 @@ var GO_METERS = [
 ];
 var resetOf = (meter) => toEpochMs(meter.resetsAt ?? meter.resetAt ?? meter.resetsAtMs ?? meter.resetAtMs ?? null);
 var parseGoStatus = (json) => {
-  if (!isObject3(json))
+  if (!isObject4(json))
     return { ok: false, error: "OpenCode Go status was not an object." };
   const product = typeof json.product === "string" ? json.product : "";
   const planLabel = GO_PRODUCTS[product];
   if (!planLabel)
     return { ok: false, error: product ? `This account is on "${product}", not an OpenCode Go plan.` : "OpenCode Go status named no product." };
-  const access = isObject3(json.access) ? json.access : null;
-  const meters = access && isObject3(access.meters) ? access.meters : null;
+  const access = isObject4(json.access) ? json.access : null;
+  const meters = access && isObject4(access.meters) ? access.meters : null;
   if (!access)
     return { ok: false, error: "No active OpenCode Go subscription on the selected Console account." };
   if (!meters)
@@ -1556,7 +1817,7 @@ var parseGoStatus = (json) => {
   const windows = {};
   for (const { source, name, windowSeconds } of GO_METERS) {
     const meter = meters[source];
-    if (!isObject3(meter))
+    if (!isObject4(meter))
       continue;
     const limit = parseMicroCents(meter.limitMicroCents);
     const used = parseMicroCents(meter.usedMicroCents);
@@ -1570,8 +1831,8 @@ var parseGoStatus = (json) => {
   return { ok: true, value: { planLabel, windows } };
 };
 var parseBilling = (json) => {
-  const source = isObject3(json) && isObject3(json.data) && json.availableMicroCents === undefined ? json.data : json;
-  if (!isObject3(source))
+  const source = isObject4(json) && isObject4(json.data) && json.availableMicroCents === undefined ? json.data : json;
+  if (!isObject4(source))
     return null;
   const micro = parseMicroCents(source.availableMicroCents);
   if (micro === null)
@@ -1579,14 +1840,14 @@ var parseBilling = (json) => {
   return { usedPercent: null, valueLabel: usd2(micro / MICRO_CENTS_PER_DOLLAR) };
 };
 var parseGoInference = (json) => {
-  const usage = isObject3(json) && isObject3(json.usage) ? json.usage : null;
+  const usage = isObject4(json) && isObject4(json.usage) ? json.usage : null;
   if (!usage)
     return { ok: false, error: "OpenCode Go usage had no usage block." };
   const map = [["rolling", "5h", 5 * 3600], ["weekly", "weekly", 7 * 86400], ["monthly", "monthly", null]];
   const windows = {};
   for (const [source, name, windowSeconds] of map) {
     const entry = usage[source];
-    if (!isObject3(entry))
+    if (!isObject4(entry))
       continue;
     const percent2 = num2(entry.percent);
     if (percent2 === null)
@@ -1602,10 +1863,10 @@ var parseGoInference = (json) => {
   return { ok: true, value: { windows } };
 };
 var parseOllamaBalance = (json) => {
-  if (!isObject3(json))
+  if (!isObject4(json))
     return { ok: false, error: "Ollama balance was not an object." };
   const windows = {};
-  const included = isObject3(json.included) ? json.included : null;
+  const included = isObject4(json.included) ? json.included : null;
   if (included) {
     const balance = num2(included.balance_usd);
     const allowance = num2(included.allowance_usd);
@@ -1617,21 +1878,21 @@ var parseOllamaBalance = (json) => {
         valueLabel: `${usd2(Math.max(0, balance))} left`,
         value: { kind: "spend", spent, limit: allowance }
       };
-      const period = isObject3(included.period) ? included.period : null;
+      const period = isObject4(included.period) ? included.period : null;
       const until = period ? toEpochMs(period.until) : null;
       if (until !== null)
         window2.resetAt = until;
       windows.monthly = window2;
     }
   }
-  const purchased = isObject3(json.purchased) ? json.purchased : null;
+  const purchased = isObject4(json.purchased) ? json.purchased : null;
   const purchasedBalance = purchased ? num2(purchased.balance_usd) : null;
   if (purchasedBalance !== null && purchasedBalance > 0) {
     windows.credits_balance = { usedPercent: null, valueLabel: usd2(purchasedBalance) };
   }
   for (const [source, name, seconds] of [["session", "5h", 5 * 3600], ["weekly", "weekly", 7 * 86400]]) {
     const entry = json[source];
-    if (!isObject3(entry))
+    if (!isObject4(entry))
       continue;
     const remaining = num2(entry.remaining_percent);
     if (remaining === null)
@@ -1651,7 +1912,7 @@ var parseOllamaUsage = (json, fetchedAt) => {
   let range = "7d";
   if (Array.isArray(json))
     list = json;
-  else if (isObject3(json)) {
+  else if (isObject4(json)) {
     if (typeof json.range === "string")
       range = json.range;
     for (const key of ["models", "usage", "data", "items", "results", "groups"]) {
@@ -1660,8 +1921,8 @@ var parseOllamaUsage = (json, fetchedAt) => {
         list = candidate;
         break;
       }
-      if (isObject3(candidate)) {
-        list = Object.entries(candidate).map(([model, value]) => isObject3(value) ? { model, ...value } : { model });
+      if (isObject4(candidate)) {
+        list = Object.entries(candidate).map(([model, value]) => isObject4(value) ? { model, ...value } : { model });
         break;
       }
     }
@@ -1670,7 +1931,7 @@ var parseOllamaUsage = (json, fetchedAt) => {
     return null;
   const models = [];
   for (const item of list) {
-    if (!isObject3(item))
+    if (!isObject4(item))
       continue;
     const model = [item.model, item.name, item.group, item.key].find((v) => typeof v === "string" && v !== "");
     if (!model)
@@ -1693,11 +1954,11 @@ var currencyLabel = (amount, currency) => {
   return `${amount.toFixed(2)} ${currency}`;
 };
 var parseDeepSeekBalance = (json) => {
-  const infos = isObject3(json) && Array.isArray(json.balance_infos) ? json.balance_infos : null;
+  const infos = isObject4(json) && Array.isArray(json.balance_infos) ? json.balance_infos : null;
   if (!infos)
     return { ok: false, error: "DeepSeek balance had no balance_infos." };
   const rows = infos.flatMap((info) => {
-    if (!isObject3(info))
+    if (!isObject4(info))
       return [];
     const currency = typeof info.currency === "string" && info.currency !== "" ? info.currency.toUpperCase() : null;
     const total = num2(info.total_balance);
@@ -2100,6 +2361,27 @@ var cleanBudgets = (value) => {
   }
   return out;
 };
+var cleanTools = (value) => {
+  const out = {};
+  if (typeof value !== "object" || value === null || Array.isArray(value))
+    return out;
+  for (const [id, entry] of Object.entries(value)) {
+    if (typeof entry !== "object" || entry === null)
+      continue;
+    const { toolsSynced, rows } = entry;
+    if (typeof toolsSynced !== "number" || !Number.isFinite(toolsSynced) || typeof rows !== "object" || rows === null || Array.isArray(rows))
+      continue;
+    const clean = {};
+    for (const [key, row] of Object.entries(rows)) {
+      const r = row;
+      if (typeof r?.calls === "number" && typeof r.generated === "number" && typeof r.contextChars === "number" && Number.isFinite(r.calls + r.generated + r.contextChars)) {
+        clean[key] = { calls: r.calls, generated: r.generated, contextChars: r.contextChars };
+      }
+    }
+    out[id] = { toolsSynced, rows: clean };
+  }
+  return out;
+};
 var cleanSettings = (value) => {
   const merged = mergeSettings(defaultSettings(), value, false);
   return merged.ok ? merged.settings : defaultSettings();
@@ -2130,7 +2412,7 @@ var loadStore = async (path, now) => {
     if (isStore(parsed)) {
       if (parsed.version < STORE_VERSION)
         return await migrateStore(path, parsed);
-      const store = { ...emptyStore(), ...parsed, version: STORE_VERSION, budgets: cleanBudgets(parsed.budgets), settings: cleanSettings(parsed.settings) };
+      const store = { ...emptyStore(), ...parsed, version: STORE_VERSION, tools: cleanTools(parsed.tools), toolsPending: typeof parsed.toolsPending === "number" ? parsed.toolsPending : 0, budgets: cleanBudgets(parsed.budgets), settings: cleanSettings(parsed.settings) };
       pruneStore(store, now);
       return store;
     }
@@ -2191,7 +2473,7 @@ var createService = async (options) => {
     lastAttemptAt = now();
     if (!reader) {
       store.lastError = MISSING_OPENCODE;
-      return { processed: 0, pending: store.pending, error: MISSING_OPENCODE, listed: false };
+      return { processed: 0, pending: store.pending, toolsPending: store.toolsPending, error: MISSING_OPENCODE, listed: false };
     }
     syncing = true;
     try {
@@ -2199,7 +2481,7 @@ var createService = async (options) => {
     } catch (error) {
       const message = error instanceof Error ? error.message : "sync failed";
       store.lastError = message;
-      return { processed: 0, pending: store.pending, error: message, listed: false };
+      return { processed: 0, pending: store.pending, toolsPending: store.toolsPending, error: message, listed: false };
     } finally {
       syncing = false;
       version += 1;
@@ -2214,7 +2496,7 @@ var createService = async (options) => {
       try {
         for (let i = 0;i < CHAIN_MAX; i += 1) {
           const outcome = await runBatch();
-          if (!outcome || !outcome.listed || outcome.error || outcome.pending === 0)
+          if (!outcome || !outcome.listed || outcome.error || outcome.pending === 0 && outcome.toolsPending === 0)
             break;
           await sleep(CHAIN_GAP_MS);
         }
@@ -2229,7 +2511,7 @@ var createService = async (options) => {
     const at = now();
     if (at - lastAttemptAt < ATTEMPT_GAP_MS)
       return;
-    if (store.syncedAt === null || at - store.syncedAt > SYNC_EVERY_MS || store.pending > 0)
+    if (store.syncedAt === null || at - store.syncedAt > SYNC_EVERY_MS || store.pending > 0 || store.toolsPending > 0)
       startChain();
   };
   const panelPayload = () => {
@@ -2256,6 +2538,8 @@ var createService = async (options) => {
       budgets,
       overCap: badgeCount(budgets) ?? 0,
       rebuilding: store.rebuilding === true,
+      toolsRead: Object.keys(store.tools).length,
+      toolsPending: store.toolsPending,
       settings: store.settings,
       defaults: defaultSettings(),
       collapsedProjects: collapsedProjects(store)
@@ -2329,7 +2613,7 @@ var createService = async (options) => {
     if (syncing)
       return { syncedAt: store.syncedAt, sessions: 0, pending: store.pending, running: true };
     const outcome = await runBatch();
-    if (outcome && outcome.listed && !outcome.error && outcome.pending > 0)
+    if (outcome && outcome.listed && !outcome.error && (outcome.pending > 0 || outcome.toolsPending > 0))
       startChain();
     return {
       syncedAt: store.syncedAt,

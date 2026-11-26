@@ -4,9 +4,15 @@ import {
   MAX_SESSIONS_PER_RUN,
   applySession,
   applySkippedSession,
+  applySkippedTools,
+  applyToolsOnly,
+  countToolsPending,
+  markParents,
   pruneStore,
   reattributeSessions,
+  selectRecentSessions,
   selectSessions,
+  selectToolSessions,
   toEpochMs,
 } from './ledger.ts';
 import type { SessionRef } from './ledger.ts';
@@ -81,6 +87,22 @@ const agentOf = (raw: Record<string, unknown>): string | null => {
   return null;
 };
 
+/**
+ * The session this one was spawned from. OpenCode 2 names it `parentID`; `parentId`, `parent_id` and a
+ * `parent` that is the id or `{ id }` are read too. Null when the listing names none: a missing field
+ * is not evidence that a session has no parent, and nothing is derived from anything else.
+ */
+const parentOf = (raw: Record<string, unknown>): string | null => {
+  for (const key of ['parentID', 'parentId', 'parent_id']) {
+    const value = raw[key];
+    if (typeof value === 'string' && value.trim() !== '') return value.trim();
+  }
+  const parent = raw.parent;
+  if (typeof parent === 'string' && parent.trim() !== '') return parent.trim();
+  if (isObject(parent) && typeof parent.id === 'string' && parent.id.trim() !== '') return parent.id.trim();
+  return null;
+};
+
 export const sessionRefOf = (raw: unknown): SessionRef | null => {
   if (!isObject(raw)) return null;
   const id = typeof raw.id === 'string' && raw.id !== '' ? raw.id : null;
@@ -88,7 +110,7 @@ export const sessionRefOf = (raw: unknown): SessionRef | null => {
   const time = isObject(raw.time) ? raw.time : {};
   const updated = toEpochMs(time.updated ?? raw.updatedAt ?? raw.updated ?? time.created ?? raw.createdAt);
   if (updated === null) return null;
-  return { id, updated, directory: directoryOf(raw), agent: agentOf(raw) };
+  return { id, updated, directory: directoryOf(raw), agent: agentOf(raw), parent: parentOf(raw) };
 };
 
 export const createOpenCodeReader = (baseUrl: string, token: string, fetchFn: FetchFn = fetch): OpenCodeReader => {
@@ -142,14 +164,20 @@ export const createOpenCodeReader = (baseUrl: string, token: string, fetchFn: Fe
   };
 };
 
-export type SyncOutcome = { processed: number; pending: number; error: string | null; listed: boolean };
+export type SyncOutcome = { processed: number; pending: number; toolsPending: number; error: string | null; listed: boolean };
 
 /**
- * One bounded sync run. Reads the session list, then the messages of at most
- * `maxSessions` sessions that are unseen or changed, oldest first. A refusal for
- * good (4xx, a 404 included) skips that session until it changes; a transient
- * failure (network, 5xx, 429) ends the run with the rest pending, so the next
- * trigger retries.
+ * One bounded sync run, at most `maxSessions` message reads. A session is read for its buckets and
+ * its tool calls together, so one read fills both. The order is:
+ *
+ * 1. sessions changed in the last 30 days that lack current buckets or tool calls, newest first, so
+ *    the Surfaces tab fills from recent work while older history is still being read;
+ * 2. sessions never seen or changed since they were read, oldest first (the rebuild after a store
+ *    migration, unchanged by the tool pass);
+ * 3. sessions whose buckets are current but whose tool calls are not, newest first.
+ *
+ * A refusal for good (4xx, a 404 included) skips that session until it changes; a transient failure
+ * (network, 5xx, 429) ends the run with the rest pending, so the next trigger retries.
  */
 export const syncOnce = async (
   store: Store,
@@ -162,38 +190,52 @@ export const syncOnce = async (
   } catch (error) {
     const message = error instanceof Error ? error.message : 'OpenCode session list failed';
     store.lastError = message;
-    return { processed: 0, pending: store.pending, error: message, listed: false };
+    return { processed: 0, pending: store.pending, toolsPending: store.toolsPending, error: message, listed: false };
   }
 
   // A session whose folder moved is re-attributed from the list alone: no extra request.
   reattributeSessions(store, refs);
+  markParents(store, refs);
 
-  const { selected, pending } = selectSessions(refs, store.sessions, {
-    max: options.maxSessions ?? MAX_SESSIONS_PER_RUN,
-  });
+  const max = options.maxSessions ?? MAX_SESSIONS_PER_RUN;
   let processed = 0;
   let error: string | null = null;
-  let left = pending;
-  for (const [index, ref] of selected.entries()) {
-    try {
-      applySession(store, ref, await reader.listMessages(ref.id));
-      processed += 1;
-    } catch (caught) {
-      const message = caught instanceof Error ? caught.message : 'OpenCode message read failed';
-      if (caught instanceof UpstreamError && !caught.transient) {
-        applySkippedSession(store, ref, message);
-        continue;
+
+  /** Read each session; the first transient failure ends the run. Returns false when it did. */
+  const readAll = async (batch: SessionRef[]): Promise<boolean> => {
+    for (const ref of batch) {
+      const buckets = store.sessions[ref.id];
+      const needsBuckets = buckets === undefined || buckets.updated < ref.updated;
+      try {
+        const messages = await reader.listMessages(ref.id);
+        if (needsBuckets) applySession(store, ref, messages);
+        else applyToolsOnly(store, ref, messages);
+        processed += 1;
+      } catch (caught) {
+        const message = caught instanceof Error ? caught.message : 'OpenCode message read failed';
+        if (caught instanceof UpstreamError && !caught.transient) {
+          if (needsBuckets) applySkippedSession(store, ref, message);
+          else applySkippedTools(store, ref);
+          continue;
+        }
+        error = message;
+        return false;
       }
-      error = message;
-      left += selected.length - index;
-      break;
     }
-  }
+    return true;
+  };
+
+  let ok = await readAll(selectRecentSessions(refs, store, { now: options.now, max }));
+  if (ok) ok = await readAll(selectSessions(refs, store.sessions, { max: Math.max(0, max - processed) }).selected);
+  if (ok) await readAll(selectToolSessions(refs, store, { max: Math.max(0, max - processed) }));
+
+  const left = selectSessions(refs, store.sessions, { max: 0 }).pending;
   pruneStore(store, options.now);
   store.syncedAt = options.now;
   store.pending = left;
+  store.toolsPending = countToolsPending(refs, store);
   store.lastError = error;
   // The history is whole again once a clean run leaves nothing to read.
   if (store.rebuilding && error === null && left === 0) delete store.rebuilding;
-  return { processed, pending: left, error, listed: true };
+  return { processed, pending: left, toolsPending: store.toolsPending, error, listed: true };
 };
